@@ -503,8 +503,8 @@ def show_sports_journal(api_key):
                "Player props, postponed games, special rules and voids need manual review.")
 
 
-def show_sports():
-    st.header("NFL and MLB research")
+def show_sports(sport_name="NFL", sport="americanfootball_nfl"):
+    st.header(f"{sport_name} • Odds research")
     try:
         api_key = st.secrets.get("ODDS_API_KEY", "")
     except Exception:
@@ -516,8 +516,6 @@ def show_sports():
         st.caption("Do not put your key in GitHub or chat. If this app is public, visitors can use "
                    "its shared feed quota. Make it private before adding your key.")
         return
-    sport_name = st.selectbox("Sport", ["NFL", "MLB"])
-    sport = "americanfootball_nfl" if sport_name == "NFL" else "baseball_mlb"
     st.caption("Feeds fetch automatically on opening this section. Responses are cached for five minutes. "
                "There is no background polling while the app is closed.")
     if st.button("Refresh sports feeds"):
@@ -530,7 +528,7 @@ def show_sports():
         return
     st.caption(f"The Odds API | Fetched {fetched} | Credits remaining at fetch: {quota}. "
                "Game lines request up to 3 credits; props add credits; final scores request up to 2 per sport.")
-    mode = st.radio("Markets", ["Game lines", "Player props"], horizontal=True)
+    mode = st.radio("Markets", ["Game lines", "Player props"] if sport_name in ("NFL", "MLB") else ["Game lines"], horizontal=True)
     if mode == "Player props" and events:
         event_map = {e["id"]: e for e in events}
         selected_event = st.selectbox("Game", list(event_map), format_func=lambda k:
@@ -573,6 +571,7 @@ def show_sports():
         st.download_button("Export current odds snapshot", view.to_csv(index=False),
                            f"{sport_name.lower()}_odds.csv", "text/csv")
         pregame = best.loc[pd.to_datetime(best.start, utc=True, errors="coerce") > pd.Timestamp.now(tz="UTC")] if not best.empty else best
+        render_parlays(fresh)
         st.subheader("Record a paper single")
         st.caption("Only fresh pregame quotes can be logged. Entries are simulations with a $0 real-money budget.")
         if not pregame.empty:
@@ -1786,10 +1785,24 @@ def show_table_tennis():
 
 
 def main():
-    st.set_page_config(page_title="Trading and Sports Lab", page_icon="B", layout="wide")
-    st.title("Trading and Sports Lab - v12")
-    st.caption("Live market analysis | You simulate trades manually | No real-money orders or leverage")
-    section = st.radio("Research area", ["BTC contract tracking", "Kalshi all crypto", "BTC trading", "NFL and MLB", "Table tennis", "Kalshi tennis"], horizontal=True, key="research_area")
+    st.set_page_config(page_title="Trout Sports Lab", page_icon="🏟️", layout="wide")
+    st.markdown("""<style>
+    .block-container {max-width:1250px;padding-top:2rem}
+    h1 {letter-spacing:-1.4px} h2 {letter-spacing:-.5px}
+    div[data-testid="stMetric"] {border:1px solid #3b4758;border-radius:12px;padding:16px}
+    .stButton>button {border-radius:8px}
+    </style>""", unsafe_allow_html=True)
+    st.title("Trout Sports Lab")
+    st.caption("SPORTS INTELLIGENCE  /  ODDS COMPARISON  /  PAPER RESEARCH")
+    pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
+    section = st.sidebar.radio("Workspace", pages, key="research_area")
+    st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
+    if section in ("All-sports leaderboard", "Sport sections"):
+        sports_workspace(section == "All-sports leaderboard")
+        return
+    if section == "Paper journal":
+        show_sports_journal(odds_key())
+        return
     if section == "Kalshi tennis":
         show_tennis()
         return
@@ -1802,9 +1815,7 @@ def main():
     if section == "Kalshi all crypto":
         show_crypto_scanner()
         return
-    if section == "NFL and MLB":
-        show_sports()
-        return
+    _kc_render()
     with st.sidebar:
         interval = st.selectbox("Signal timeframe", ["15m", "1h"])
         max_daily = st.number_input("Max research signals/day", 1, 20, 4)
@@ -1956,8 +1967,7 @@ def main():
                  "contract quotes and settlements is still required.")
 
 
-if __name__ == "__main__":
-    main()
+
 import re as _kc_re
 from datetime import datetime as _kc_datetime, timezone as _kc_timezone
 from urllib.parse import quote as _kc_quote
@@ -2102,5 +2112,125 @@ def _kc_render():
         _kc_st.session_state.pop("kalshi_selected_contract", None)
         _kc_st.error(f"Could not load Kalshi crypto data: {error}")
 
-if st.session_state.get("research_area") not in ("BTC contract tracking", "Table tennis", "Kalshi tennis"):
-    _kc_render()
+
+
+
+def odds_key():
+    try:
+        return st.secrets.get("ODDS_API_KEY", "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def active_sports(api_key):
+    catalog, _, _ = get_json("https://api.the-odds-api.com/v4/sports?" + urlencode({"apiKey": api_key}))
+    return [r for r in catalog if r.get("active") and not r.get("has_outrights")]
+
+
+def eligible_quotes(rows):
+    if rows.empty:
+        return rows.copy()
+    now = pd.Timestamp.now(tz="UTC")
+    starts = pd.to_datetime(rows.start, utc=True, errors="coerce")
+    times = pd.to_datetime(rows.quote_time, utc=True, errors="coerce")
+    return rows.loc[(starts > now) & ((now-times).dt.total_seconds().between(0, 600))].copy()
+
+
+def render_parlays(rows):
+    st.subheader("Parlay research")
+    rows = eligible_quotes(rows)
+    if rows.empty:
+        st.info("No fresh pregame legs. Refresh odds to build a research ticket.")
+        return
+    # All legs must be offered at the same book; no synthetic cross-book ticket.
+    book = st.selectbox("Ticket sportsbook", sorted(rows.book.unique()), key="parlay_book")
+    pool = rows[rows.book == book].dropna(subset=["normalized_market_pct"]).sort_values("normalized_market_pct", ascending=False)
+    pool = pool.drop_duplicates("event_id").reset_index(drop=True)
+    st.caption("One market-favored candidate per game. Same-game combinations are excluded. Book acceptance must be checked separately.")
+    if len(pool) < 2:
+        st.info("At least two different games with complete market prices are needed.")
+        return
+    ids = st.multiselect("Choose 2–4 legs", list(pool.index), default=list(pool.index[:2]), max_selections=4,
+        format_func=lambda i: f"{pool.iloc[i].game} | {pool.iloc[i].selection} {pool.iloc[i].line} | {pool.iloc[i].decimal_odds:.2f}")
+    if len(ids) < 2:
+        return
+    legs = pool.loc[ids]
+    st.dataframe(legs[["game", "market", "selection", "line", "decimal_odds", "normalized_market_pct"]], hide_index=True, use_container_width=True)
+    price = float(legs.decimal_odds.prod())
+    estimate = float((legs.normalized_market_pct / 100).prod())
+    c1, c2 = st.columns(2)
+    c1.metric("Indicative combined decimal odds", f"{price:.2f}")
+    c2.metric("Independence estimate", f"{estimate:.1%}")
+    st.caption("The probability multiplies margin-adjusted book estimates under an independence assumption. Cross-game correlation and model error can change the actual chance. Combined prices are illustrative and exclude promotions.")
+    st.download_button("Export research ticket", legs.to_csv(index=False), "parlay_research.csv", "text/csv")
+
+
+def sports_workspace(combined):
+    key = odds_key()
+    st.header("All-sports leaderboard" if combined else "Sport sections")
+    st.caption("Rank upcoming games by market-estimated likelihood, or compare payouts for the exact same selection. Tennis and table tennis also have dedicated Kalshi sections in the sidebar.")
+    if not key:
+        st.info("Add ODDS_API_KEY to Streamlit Secrets to load the sports catalog and current sportsbook odds.")
+        st.code('ODDS_API_KEY = "YOUR_KEY"', language="toml")
+        st.write("The sidebar preserves your Kalshi and BTC research tools. No sportsbook data or picks are invented while the feed is disconnected.")
+        return
+    try:
+        catalog = active_sports(key)
+    except (FeedError, ValueError, TypeError):
+        st.error("Could not load the sports catalog. Check your key and feed access.")
+        return
+    if not catalog:
+        st.info("No active sports returned by the provider.")
+        return
+    by_key = {r['key']: r for r in catalog}
+    if not combined:
+        group = st.selectbox("Sport category", sorted({r.get('group', 'Other') for r in catalog}))
+        leagues = [r['key'] for r in catalog if r.get('group', 'Other') == group]
+        selected = st.selectbox("League / competition", leagues, format_func=lambda k: by_key[k]['title'])
+        show_sports(by_key[selected]['title'], selected)
+        return
+    selected = st.multiselect("Leagues to scan", list(by_key), default=[k for k in ('americanfootball_nfl', 'basketball_nba', 'icehockey_nhl') if k in by_key], format_func=lambda k: by_key[k]['title'])
+    st.caption("Scan only the leagues you want. Each league uses feed credits; snapshots are cached for five minutes.")
+    if st.button("Scan selected leagues", type="primary", disabled=not selected):
+        frames, errors = [], []
+        for league in selected:
+            try:
+                events, quota, fetched = sports_feed(league, key)
+                frame = odds_rows(events, fetched)
+                frames.append(frame)
+            except (FeedError, ValueError, TypeError):
+                errors.append(by_key[league]['title'])
+        st.session_state['leaderboard'] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        st.session_state['scan_errors'] = errors
+    for error in st.session_state.get('scan_errors', []):
+        st.warning(f"{error}: feed unavailable for this scan.")
+    raw = st.session_state.get('leaderboard', pd.DataFrame())
+    if raw.empty:
+        st.info("Choose leagues and scan to see available upcoming games.")
+        return
+    rows = eligible_quotes(raw)
+    if selected and not rows.empty:
+        rows = rows[rows.sport.isin(selected)]
+    else:
+        rows = rows.iloc[:0]
+    if rows.empty:
+        st.info("No fresh upcoming quotes remain. Scan again.")
+        return
+    books = st.multiselect("Sportsbooks", sorted(rows.book.unique()), default=sorted(rows.book.unique()))
+    rows = rows[rows.book.isin(books)]
+    rank = st.radio("Rank by", ["Market-estimated likelihood", "Best payout"], horizontal=True)
+    best = best_quotes(rows).copy()
+    best = best.sort_values('normalized_market_pct' if rank == 'Market-estimated likelihood' else 'decimal_odds', ascending=False)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Upcoming games", rows.event_id.nunique())
+    c2.metric("Sportsbooks", rows.book.nunique())
+    c3.metric("Leagues", rows.sport.nunique())
+    st.dataframe(best[["sport", "game", "start", "market", "selection", "line", "book", "american_odds", "normalized_market_pct", "quote_time"]], hide_index=True, use_container_width=True)
+    st.caption("Percentages are margin-adjusted sportsbook estimates where complete outcome prices exist. They are not validated forecasts. Injury reports and starting lineups are not verified. Best payout ranks price, not likelihood or expected profit.")
+    st.download_button("Export leaderboard", best.to_csv(index=False), "sports_leaderboard.csv", "text/csv")
+    render_parlays(rows)
+
+
+if __name__ == "__main__":
+    main()
