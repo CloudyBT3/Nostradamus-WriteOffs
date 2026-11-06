@@ -503,7 +503,7 @@ def show_sports_journal(api_key):
                "Player props, postponed games, special rules and voids need manual review.")
 
 
-def show_sports(sport_name="NFL", sport="americanfootball_nfl"):
+def show_sports(sport_name="NFL", sport="americanfootball_nfl", markets="h2h,spreads,totals"):
     st.header(f"{sport_name} • Odds research")
     try:
         api_key = st.secrets.get("ODDS_API_KEY", "")
@@ -522,19 +522,19 @@ def show_sports(sport_name="NFL", sport="americanfootball_nfl"):
         sports_feed.clear()
     try:
         with st.spinner("Loading game odds..."):
-            events, quota, fetched = sports_feed(sport, api_key)
+            events, quota, fetched = sports_feed(sport, api_key, markets)
     except FeedError as exc:
         st.error(str(exc))
         return
     st.caption(f"The Odds API | Fetched {fetched} | Credits remaining at fetch: {quota}. "
                "Game lines request up to 3 credits; props add credits; final scores request up to 2 per sport.")
-    mode = st.radio("Markets", ["Game lines", "Player props"] if sport_name in ("NFL", "MLB") else ["Game lines"], horizontal=True)
+    mode = st.radio("Markets", ["Game lines", "Player props"] if sport in ("americanfootball_nfl", "baseball_mlb") else ["Game lines"], horizontal=True)
     if mode == "Player props" and events:
         event_map = {e["id"]: e for e in events}
         selected_event = st.selectbox("Game", list(event_map), format_func=lambda k:
             f"{event_map[k]['away_team']} @ {event_map[k]['home_team']}")
         options = {"Passing yards": "player_pass_yds", "Rushing yards": "player_rush_yds",
-                   "Receiving yards": "player_reception_yds", "Receptions": "player_receptions"} if sport_name == "NFL" else {
+                   "Receiving yards": "player_reception_yds", "Receptions": "player_receptions"} if sport == "americanfootball_nfl" else {
                    "Pitcher strikeouts": "pitcher_strikeouts", "Hits": "batter_hits", "Total bases": "batter_total_bases"}
         label = st.selectbox("Prop category", list(options))
         try:
@@ -562,7 +562,9 @@ def show_sports(sport_name="NFL", sport="americanfootball_nfl"):
         best = best_quotes(fresh)
         columns = ["game", "book", "market", "player", "selection", "line", "american_odds",
                    "implied_pct", "normalized_market_pct", "quote_time"]
-        st.dataframe(best[columns] if not best.empty else best, use_container_width=True)
+        simple_pick_cards(eligible_quotes(best))
+        with st.expander("Full comparison table"):
+            st.dataframe(best[columns] if not best.empty else best, use_container_width=True)
         st.caption("Implied % = 1 / decimal odds. Normalized market % proportionally removes the book's "
                    "margin only where a complete outcome pair exists. For lines with a possible push, "
                    "this is conditional on a decisive result. Higher payout alone does not establish value.")
@@ -1787,15 +1789,19 @@ def show_table_tennis():
 def main():
     st.set_page_config(page_title="Trout Sports Lab", page_icon="🏟️", layout="wide")
     st.markdown("""<style>
-    .block-container {max-width:1250px;padding-top:2rem}
+    .block-container {max-width:1100px;padding-top:1.5rem}
+    [data-testid="stVerticalBlockBorderWrapper"] {border-radius:18px}
+    .stButton>button {min-height:48px;font-weight:600}
+    [data-testid="stSidebar"] {border-right:1px solid #64748b33}
     h1 {letter-spacing:-1.4px} h2 {letter-spacing:-.5px}
     div[data-testid="stMetric"] {border:1px solid #3b4758;border-radius:12px;padding:16px}
     .stButton>button {border-radius:8px}
     </style>""", unsafe_allow_html=True)
     st.title("Trout Sports Lab")
-    st.caption("SPORTS INTELLIGENCE  /  ODDS COMPARISON  /  PAPER RESEARCH")
+    st.caption("Find a sport. Compare the odds. Understand your pick.")
     pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
-    section = st.sidebar.radio("Workspace", pages, key="research_area")
+    labels = dict(zip(pages, ["🏠 Top picks", "🏟️ All sports", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
+    section = st.sidebar.radio("Where would you like to go?", pages, format_func=lambda p: labels[p], key="research_area")
     st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
     if section in ("All-sports leaderboard", "Sport sections"):
         sports_workspace(section == "All-sports leaderboard")
@@ -2125,7 +2131,7 @@ def odds_key():
 @st.cache_data(ttl=3600, show_spinner=False)
 def active_sports(api_key):
     catalog, _, _ = get_json("https://api.the-odds-api.com/v4/sports?" + urlencode({"apiKey": api_key}))
-    return [r for r in catalog if r.get("active") and not r.get("has_outrights")]
+    return sorted([r for r in catalog if r.get("active") and r.get("key")], key=lambda r: (r.get("group", "Other"), r.get("title", "")))
 
 
 def eligible_quotes(rows):
@@ -2138,8 +2144,11 @@ def eligible_quotes(rows):
 
 
 def render_parlays(rows):
-    st.subheader("Parlay research")
+    st.subheader("Build a practice parlay")
+    st.caption("Every pick must win. Adding picks usually lowers the chance of winning.")
     rows = eligible_quotes(rows)
+    if not rows.empty:
+        rows = rows.loc[rows.market != "outrights"]
     if rows.empty:
         st.info("No fresh pregame legs. Refresh odds to build a research ticket.")
         return
@@ -2161,15 +2170,48 @@ def render_parlays(rows):
     estimate = float((legs.normalized_market_pct / 100).prod())
     c1, c2 = st.columns(2)
     c1.metric("Indicative combined decimal odds", f"{price:.2f}")
-    c2.metric("Independence estimate", f"{estimate:.1%}")
+    c2.metric("Estimated chance if legs are independent", f"{estimate:.1%}")
     st.caption("The probability multiplies margin-adjusted book estimates under an independence assumption. Cross-game correlation and model error can change the actual chance. Combined prices are illustrative and exclude promotions.")
     st.download_button("Export research ticket", legs.to_csv(index=False), "parlay_research.csv", "text/csv")
 
 
+
+def simple_pick_cards(rows, sort_by_chance=True):
+    st.subheader("Picks at a glance")
+    st.caption("Best available prices. Market chances come from prices, not a proven prediction model.")
+    if rows.empty:
+        st.info("No fresh upcoming picks here yet.")
+        return
+    ordered = rows.sort_values("normalized_market_pct", ascending=False) if sort_by_chance else rows
+    candidates = ordered.drop_duplicates("event_id").head(6)
+    for _, row in candidates.iterrows():
+        with st.container(border=True):
+            st.caption(str(row.game))
+            line = "" if pd.isna(row.line) else f" {row.line:g}"
+            market = {"h2h": "Winner", "spreads": "Point spread", "totals": "Total score", "outrights": "Season winner"}.get(row.market, row.market)
+            player = f"{row.player} " if row.player else ""
+            st.subheader(f"{player}{row.selection}{line}")
+            st.write(f"{market} · {row.book}")
+            chance = row.normalized_market_pct
+            a, b = st.columns(2)
+            a.metric("Market chance", "Not available" if pd.isna(chance) else f"{chance:.0f}%")
+            b.metric("Odds", f"{int(row.american_odds):+d}")
+            st.caption(f"A $1 practice stake returns ${row.decimal_odds:.2f} total if it wins, including the $1 stake.")
+            start = pd.to_datetime(row.start, utc=True, errors="coerce")
+            if pd.notna(start):
+                st.caption("Starts " + start.tz_convert("America/New_York").strftime("%b %d · %I:%M %p %Z"))
+            with st.expander("Why is this shown?"):
+                st.write("This is the first selection for this game under your current sorting. The displayed book has the best available payout for this exact selection in this scan.")
+                st.caption("Chances may be conditional on no tie or push. Injuries and lineups are not checked. Prices can change.")
+
+
 def sports_workspace(combined):
     key = odds_key()
-    st.header("All-sports leaderboard" if combined else "Sport sections")
-    st.caption("Rank upcoming games by market-estimated likelihood, or compare payouts for the exact same selection. Tennis and table tennis also have dedicated Kalshi sections in the sidebar.")
+    st.header("Your sports dashboard" if combined else "Find your sport")
+    st.write("Choose a sport, compare picks, and see what the numbers mean.")
+    with st.expander("New here? Start with these three words"):
+        st.write("**Odds:** the payout offered. **Market chance:** an estimate from sportsbook prices. **Parlay:** several picks joined together; every leg must win, subject to the book’s rules.")
+        st.caption("A bigger payout usually means a lower chance. No pick is a sure win.")
     if not key:
         st.info("Add ODDS_API_KEY to Streamlit Secrets to load the sports catalog and current sportsbook odds.")
         st.code('ODDS_API_KEY = "YOUR_KEY"', language="toml")
@@ -2184,19 +2226,29 @@ def sports_workspace(combined):
         st.info("No active sports returned by the provider.")
         return
     by_key = {r['key']: r for r in catalog}
-    if not combined:
-        group = st.selectbox("Sport category", sorted({r.get('group', 'Other') for r in catalog}))
-        leagues = [r['key'] for r in catalog if r.get('group', 'Other') == group]
-        selected = st.selectbox("League / competition", leagues, format_func=lambda k: by_key[k]['title'])
-        show_sports(by_key[selected]['title'], selected)
+    st.caption(f"{len(catalog)} active competitions across {len({r.get('group', 'Other') for r in catalog})} sport categories • supplied by your feed")
+    with st.expander("See all available sports and leagues"):
+        st.dataframe(pd.DataFrame([{"Sport": r.get('group', 'Other'), "League / competition": r.get('title', r['key']), "Type": 'Season winner' if r.get('has_outrights') else 'Game odds'} for r in catalog]), hide_index=True, use_container_width=True)
+    search = st.text_input("Find a sport or league", placeholder="Try soccer, basketball, tennis…").strip().lower()
+    visible = [r for r in catalog if not search or search in (str(r.get('group', '')) + ' ' + str(r.get('title', '')) + ' ' + r['key']).lower()]
+    if not visible:
+        st.info("No match in the current feed. Try another name.")
         return
-    selected = st.multiselect("Leagues to scan", list(by_key), default=[k for k in ('americanfootball_nfl', 'basketball_nba', 'icehockey_nhl') if k in by_key], format_func=lambda k: by_key[k]['title'])
+    if not combined:
+        group = st.selectbox("Sport category", sorted({r.get('group', 'Other') for r in visible}))
+        leagues = [r['key'] for r in visible if r.get('group', 'Other') == group]
+        selected = st.selectbox("League / competition", leagues, format_func=lambda k: by_key[k]['title'])
+        show_sports(by_key[selected]['title'], selected, 'outrights' if by_key[selected].get('has_outrights') else 'h2h,spreads,totals')
+        return
+    selected = st.multiselect("Leagues to scan", [r["key"] for r in visible], default=[k for k in ('americanfootball_nfl', 'basketball_nba', 'icehockey_nhl') if k in {r['key'] for r in visible}], format_func=lambda k: by_key[k]['title'])
+    if st.checkbox("Include every league shown above", value=False):
+        selected = [r["key"] for r in visible]
     st.caption("Scan only the leagues you want. Each league uses feed credits; snapshots are cached for five minutes.")
     if st.button("Scan selected leagues", type="primary", disabled=not selected):
         frames, errors = [], []
         for league in selected:
             try:
-                events, quota, fetched = sports_feed(league, key)
+                events, quota, fetched = sports_feed(league, key, 'outrights' if by_key[league].get('has_outrights') else 'h2h,spreads,totals')
                 frame = odds_rows(events, fetched)
                 frames.append(frame)
             except (FeedError, ValueError, TypeError):
@@ -2226,7 +2278,9 @@ def sports_workspace(combined):
     c1.metric("Upcoming games", rows.event_id.nunique())
     c2.metric("Sportsbooks", rows.book.nunique())
     c3.metric("Leagues", rows.sport.nunique())
-    st.dataframe(best[["sport", "game", "start", "market", "selection", "line", "book", "american_odds", "normalized_market_pct", "quote_time"]], hide_index=True, use_container_width=True)
+    simple_pick_cards(best, sort_by_chance=False)
+    with st.expander("Compare all prices and details"):
+        st.dataframe(best[["sport", "game", "start", "market", "selection", "line", "book", "american_odds", "normalized_market_pct", "quote_time"]], hide_index=True, use_container_width=True)
     st.caption("Percentages are margin-adjusted sportsbook estimates where complete outcome prices exist. They are not validated forecasts. Injury reports and starting lineups are not verified. Best payout ranks price, not likelihood or expected profit.")
     st.download_button("Export leaderboard", best.to_csv(index=False), "sports_leaderboard.csv", "text/csv")
     render_parlays(rows)
