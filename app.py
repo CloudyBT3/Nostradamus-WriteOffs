@@ -1,11 +1,14 @@
+import hashlib
+import hmac
 import math
+import sqlite3
 from html import escape
 import json
 import uuid
 import time
 import random
 from threading import Lock
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode, quote
 from urllib.error import HTTPError, URLError
@@ -569,7 +572,10 @@ def show_sports(sport_name="NFL", sport="americanfootball_nfl", markets="h2h,spr
             board = winner_board(eligible_quotes(view))
             favorites, tight = st.tabs(["Top winner estimates", "Close Calls"])
             with favorites:
-                render_winner_board(board)
+                if sport == "basketball_nba":
+                    render_nba_edge(nba_edge_rows(rows))
+                else:
+                    render_winner_board(board)
             with tight:
                 st.caption("The top two outcomes are within 10 percentage points across at least two books.")
                 render_winner_board(board, close=True)
@@ -1850,10 +1856,15 @@ def main():
     """, unsafe_allow_html=True)
     pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
     labels = dict(zip(pages, ["🏠 Scoreboard", "🏟️ Best by sport", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
+    pages.append("Published Picks")
+    labels["Published Picks"] = "📋 Published Picks"
     section = st.sidebar.radio("Where would you like to go?", pages, format_func=lambda p: labels[p], key="research_area")
     st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
     if section in ("All-sports leaderboard", "Sport sections"):
         sports_workspace(section == "All-sports leaderboard")
+        return
+    if section == "Published Picks":
+        show_published_picks()
         return
     if section == "Paper journal":
         show_sports_journal(odds_key())
@@ -2254,6 +2265,189 @@ def simple_pick_cards(rows, sort_by_chance=True):
                 st.caption("Chances may be conditional on no tie or push. Injuries and lineups are not checked. Prices can change.")
 
 
+NBA_EDGE_VERSION = "nba-moneyline-v1"
+
+
+def nba_edge_rows(rows):
+    if rows.empty:
+        return []
+    winners = eligible_quotes(rows)
+    winners = winners.loc[winners.sport.eq("basketball_nba") & winners.market.eq("h2h")]
+    decisions = []
+    for event_id, event in winners.groupby("event_id"):
+        first = event.iloc[0]
+        teams = set(first.game.split(" @ "))
+        if len(teams) != 2:
+            continue
+        complete = [
+            quotes for _, quotes in event.groupby("book")
+            if len(quotes) == 2 and set(quotes.selection) == teams
+            and quotes.normalized_market_pct.notna().all()
+        ]
+        sides = []
+        if complete:
+            for selection, quotes in pd.concat(complete).groupby("selection"):
+                quotes = quotes.sort_values(["decimal_odds", "book"], ascending=[False, True])
+                offer = quotes.iloc[0]
+                peers = quotes.iloc[1:]
+                chance = float(peers.normalized_market_pct.mean()) if len(peers) >= 2 else None
+                hurdle = 100 / float(offer.decimal_odds)
+                sides.append(dict(
+                    selection=selection, book=offer.book, decimal_odds=float(offer.decimal_odds),
+                    american_odds=int(offer.american_odds), quote_time=str(offer.quote_time),
+                    market_chance=chance, break_even=hurdle,
+                    gap=None if chance is None else chance - hurdle,
+                    peers=[dict(book=p.book, chance=float(p.normalized_market_pct),
+                                quote_time=str(p.quote_time)) for p in peers.itertuples()],
+                ))
+        candidates = [side for side in sides if side["gap"] is not None and side["gap"] >= 3]
+        pick = max(candidates, key=lambda side: side["gap"]) if candidates else None
+        decisions.append(dict(
+            event_id=event_id, game=first.game, start=str(first.start), market="h2h", line=None,
+            selection=pick["selection"] if pick else None, sides=sides, version=NBA_EDGE_VERSION,
+            decision="PICK" if pick else "PASS",
+            reason=("Gap at least 3 points" if pick else
+                    "Fewer than two other complete books" if len(complete) < 3 else
+                    "Gap below 3 points"),
+        ))
+    return decisions
+
+
+def render_nba_edge(decisions):
+    st.subheader("NBA moneyline · Pick or Pass")
+    st.caption("Paper research. Market chance excludes the book offering the price. "
+               "A pick needs two other complete books and a gap of at least 3 percentage points.")
+    for row in decisions:
+        st.markdown(f"**{row['game']}**")
+        st.write(f"**{row['decision']}** · {row['selection'] or row['reason']}")
+        if row["sides"]:
+            st.dataframe(pd.DataFrame([{
+                "Team": side["selection"], "Book": side["book"], "Odds": side["american_odds"],
+                "Market chance %": None if side["market_chance"] is None else round(side["market_chance"], 2),
+                "Break-even chance %": round(side["break_even"], 2),
+                "Gap (pts)": None if side["gap"] is None else round(side["gap"], 2),
+            } for side in row["sides"]]), hide_index=True, use_container_width=True)
+
+
+def open_nba_log(path):
+    db = sqlite3.connect(path)
+    try:
+        with db:
+            for table in ("forecasts", "grades"):
+                db.execute(f"""CREATE TABLE IF NOT EXISTS {table} (
+                    event_id TEXT PRIMARY KEY NOT NULL, recorded_at TEXT NOT NULL,
+                    payload TEXT NOT NULL)""")
+                for operation in ("UPDATE", "DELETE"):
+                    db.execute(f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
+                        BEFORE {operation} ON {table}
+                        BEGIN SELECT RAISE(ABORT, 'append-only history'); END""")
+    except sqlite3.Error:
+        db.close()
+        raise
+    return db
+
+
+def publish_nba(db, decisions):
+    saved = 0
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        for row in decisions:
+            now = pd.Timestamp.now(tz="UTC")
+            stamps = [stamp for side in row["sides"]
+                      for stamp in [side["quote_time"], *(p["quote_time"] for p in side["peers"])]]
+            if pd.Timestamp(row["start"]) <= now or any(
+                not 0 <= (now - pd.Timestamp(stamp)).total_seconds() <= 600 for stamp in stamps
+            ):
+                continue
+            saved += db.execute(
+                "INSERT INTO forecasts VALUES (?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+                (row["event_id"], now.isoformat(), json.dumps(row, sort_keys=True, allow_nan=False)),
+            ).rowcount
+    return saved
+
+
+def grade_nba(db, events):
+    finals = {event["id"]: event for event in events if event.get("completed")}
+    with db:
+        pending = db.execute("""SELECT forecasts.event_id, forecasts.payload FROM forecasts
+            LEFT JOIN grades USING(event_id) WHERE grades.event_id IS NULL""").fetchall()
+        for event_id, payload in pending:
+            row = json.loads(payload)
+            event = finals.get(event_id)
+            if not event or pd.Timestamp(row["start"]) > pd.Timestamp.now(tz="UTC"):
+                continue
+            teams = row["game"].split(" @ ")
+            outcomes = {team: game_result({**row, "selection": team}, event) for team in teams}
+            if not outcomes or any(result not in ("WIN", "LOSS", "PUSH") for result in outcomes.values()):
+                continue
+            grade = dict(outcomes=outcomes, result=outcomes.get(row["selection"], "PASS"),
+                         source="The Odds API", scores=event["scores"])
+            db.execute("INSERT INTO grades VALUES (?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+                       (event_id, pd.Timestamp.now(tz="UTC").isoformat(), json.dumps(grade, sort_keys=True)))
+
+
+def show_published_picks():
+    st.header("Published Picks")
+    st.caption("The owner publishes one pregame snapshot per matchup. Picks and passes stay in history. "
+               "Final scores are added separately.")
+    try:
+        path = st.secrets.get("NBA_LOG_PATH", "")
+        password = st.secrets.get("NBA_PUBLISH_PASSWORD", "")
+    except FileNotFoundError:
+        path, password = "", ""
+    key = odds_key()
+    if not path:
+        st.info("Set NBA_LOG_PATH to a SQLite file on a persistent disk to enable history.")
+        return
+    with st.expander("Owner controls"):
+        entered = st.text_input("Publisher password", type="password")
+        authorized = bool(password and hmac.compare_digest(entered.encode(), password.encode()))
+        publish = st.button("Scan and publish NBA picks and passes", disabled=not (authorized and key))
+        settle = st.button("Grade with recent final scores", disabled=not (authorized and key))
+    try:
+        with closing(open_nba_log(path)) as db:
+            if publish:
+                events, _, fetched = sports_feed("basketball_nba", key, "h2h")
+                decisions = nba_edge_rows(odds_rows(events, fetched))
+                count = publish_nba(db, decisions)
+                st.success(f"Published {count} new matchups. Existing snapshots were kept.")
+                render_nba_edge(decisions)
+            if settle:
+                events, _, _ = sports_feed("basketball_nba", key, scores=True)
+                grade_nba(db, events)
+                st.success("Checked recent final scores.")
+            history = []
+            for published, forecast, graded, grade in db.execute("""
+                SELECT forecasts.recorded_at, forecasts.payload, grades.recorded_at, grades.payload
+                FROM forecasts LEFT JOIN grades USING(event_id) ORDER BY forecasts.recorded_at, forecasts.event_id
+            """):
+                history.append(dict(published_at=published, forecast=json.loads(forecast),
+                                    graded_at=graded, grade=json.loads(grade) if grade else None))
+    except (sqlite3.Error, FeedError, ValueError, TypeError, KeyError):
+        st.error("Could not complete the log operation. Check the database path and sports feed.")
+        return
+    if not history:
+        st.info("No published NBA matchups yet.")
+        return
+    summary = []
+    returns = []
+    for entry in history:
+        row = entry["forecast"]
+        pick = next((side for side in row["sides"] if side["selection"] == row["selection"]), {})
+        result = entry["grade"]["result"] if entry["grade"] else "PENDING"
+        if pick and result in ("WIN", "LOSS", "PUSH"):
+            returns.append(sports_profit(1, pick["decimal_odds"], result))
+        summary.append(dict(Game=row["game"], Published=entry["published_at"], Decision=row["decision"],
+                            Pick=row["selection"], Book=pick.get("book"), Odds=pick.get("american_odds"),
+                            Result=result))
+    if returns:
+        st.caption(f"Paper ROI at recorded odds: {100 * sum(returns) / len(returns):+.1f}% across {len(returns)} graded picks, using one unit per pick.")
+    st.dataframe(pd.DataFrame(summary[::-1]), hide_index=True, use_container_width=True)
+    export = json.dumps(history, sort_keys=True, indent=2)
+    st.caption(f"Export SHA-256: {hashlib.sha256(export.encode()).hexdigest()}")
+    st.download_button("Download full history", export, "nba_published_picks.json", "application/json")
+
+
 def winner_prices(market):
     prices = []
     for selection, side in market.groupby("selection"):
@@ -2466,7 +2660,12 @@ def sports_workspace(combined):
         leagues = [k for k in selected if by_key[k].get("group", "Other") == group]
         group_board = board.loc[board.sport.isin(leagues)] if not board.empty else board
         st.caption("Ranked by the average market chance from books with a complete winner market.")
-        render_winner_board(group_board)
+        nba = nba_edge_rows(raw) if "basketball_nba" in leagues else []
+        if nba:
+            render_nba_edge(nba)
+            group_board = group_board.loc[group_board.sport.ne("basketball_nba")] if not group_board.empty else group_board
+        if not group_board.empty or not nba:
+            render_winner_board(group_board)
     with prices:
         simple_pick_cards(best, sort_by_chance=False)
     with st.expander("Compare all prices and details"):
