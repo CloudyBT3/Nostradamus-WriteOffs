@@ -1,4 +1,5 @@
 import math
+from html import escape
 import json
 import uuid
 import time
@@ -548,6 +549,8 @@ def show_sports(sport_name="NFL", sport="americanfootball_nfl", markets="h2h,spr
     else:
         events_for_rows = events
     rows = odds_rows(events_for_rows, fetched)
+    if mode == "Player props" and events:
+        player_context(eligible_quotes(rows), label, selected_event)
     st.info("These percentages come from sportsbook prices. They are market estimates, not a trained "
             "sports prediction model or guaranteed win rates. Player availability is not verified by this feed.")
     if rows.empty:
@@ -562,7 +565,16 @@ def show_sports(sport_name="NFL", sport="americanfootball_nfl", markets="h2h,spr
         best = best_quotes(fresh)
         columns = ["game", "book", "market", "player", "selection", "line", "american_odds",
                    "implied_pct", "normalized_market_pct", "quote_time"]
-        simple_pick_cards(eligible_quotes(best))
+        if mode == "Game lines" and "h2h" in markets.split(","):
+            board = winner_board(eligible_quotes(view))
+            favorites, tight = st.tabs(["Top winner estimates", "Close Calls"])
+            with favorites:
+                render_winner_board(board)
+            with tight:
+                st.caption("The top two outcomes are within 10 percentage points across at least two books.")
+                render_winner_board(board, close=True)
+        else:
+            simple_pick_cards(eligible_quotes(best))
         with st.expander("Full comparison table"):
             st.dataframe(best[columns] if not best.empty else best, use_container_width=True)
         st.caption("Implied % = 1 / decimal odds. Normalized market % proportionally removes the book's "
@@ -1789,7 +1801,21 @@ def show_table_tennis():
 def main():
     st.set_page_config(page_title="Trout Sports Lab", page_icon="🏟️", layout="wide")
     st.markdown("""<style>
-    .block-container {max-width:1100px;padding-top:1.5rem}
+    .block-container {max-width:1200px;padding-top:3rem}
+    .trout-hero {background:radial-gradient(ellipse at top right,#145c59,transparent 72%),
+      linear-gradient(120deg,#121d38,#182941);color:#fff;border-radius:24px;
+      padding:clamp(1.4rem,5vw,3rem);margin-bottom:1.25rem}
+    .trout-hero h1 {color:#fff;padding:.3rem 0;font-size:clamp(2.2rem,7vw,4.2rem)}
+    .trout-hero p {color:#dceaf4;margin:0}
+    .trout-kicker {color:#84f7d0;font-size:.8rem;letter-spacing:.16em;font-weight:800}
+    .trout-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));
+      gap:12px;margin:.75rem 0 1.25rem}
+    .trout-card {background:#172640;color:#f4f8ff;border-radius:16px;padding:1rem;
+      border-top:3px solid #75ebc4;overflow-wrap:anywhere}
+    .trout-card.close {border-top-color:#ffd485}
+    .trout-card h3 {color:#fff;font-size:1.1rem;padding:.4rem 0}
+    .trout-card p {color:#d4e1f1;margin:0 0 .4rem}
+    .trout-card strong {color:#9cf7db}
     [data-testid="stVerticalBlockBorderWrapper"] {border-radius:18px}
     .stButton>button {min-height:48px;font-weight:600}
     [data-testid="stSidebar"] {border-right:1px solid #64748b33}
@@ -1797,10 +1823,15 @@ def main():
     div[data-testid="stMetric"] {border:1px solid #3b4758;border-radius:12px;padding:16px}
     .stButton>button {border-radius:8px}
     </style>""", unsafe_allow_html=True)
-    st.title("Trout Sports Lab")
-    st.caption("Find a sport. Compare the odds. Understand your pick.")
+    st.markdown("""
+    <div class="trout-hero">
+      <div class="trout-kicker">THE PREGAME SCOREBOARD</div>
+      <h1>Trout Sports Lab</h1>
+      <p>Find tight matchups, see who the books favor, and compare prices.</p>
+    </div>
+    """, unsafe_allow_html=True)
     pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
-    labels = dict(zip(pages, ["🏠 Top picks", "🏟️ All sports", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
+    labels = dict(zip(pages, ["🏠 Scoreboard", "🏟️ Best by sport", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
     section = st.sidebar.radio("Where would you like to go?", pages, format_func=lambda p: labels[p], key="research_area")
     st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
     if section in ("All-sports leaderboard", "Sport sections"):
@@ -2205,6 +2236,95 @@ def simple_pick_cards(rows, sort_by_chance=True):
                 st.caption("Chances may be conditional on no tie or push. Injuries and lineups are not checked. Prices can change.")
 
 
+def winner_board(rows):
+    """Combine complete fresh winner markets, keeping price and chance separate."""
+    if rows.empty:
+        return pd.DataFrame()
+    winners = rows.loc[rows.market.eq("h2h")].dropna(subset=["normalized_market_pct"])
+    cards = []
+    for _, event in winners.groupby(["sport", "event_id"]):
+        # Compare only books that quote the same complete set of outcomes.
+        signatures = event.groupby("book").selection.agg(lambda names: tuple(sorted(names)))
+        signatures = signatures[signatures.map(lambda names: len(names) in (2, 3) and len(set(names)) == len(names))]
+        if signatures.empty:
+            continue
+        outcome_sets = signatures.value_counts()
+        if len(outcome_sets) > 1 and outcome_sets.iloc[0] == outcome_sets.iloc[1]:
+            continue
+        same_market = event[event.book.isin(signatures[signatures == outcome_sets.index[0]].index)]
+        chances = same_market.groupby("selection").normalized_market_pct.mean().sort_values(ascending=False)
+        quotes = best_quotes(same_market).set_index("selection")
+        top, next_pick = chances.index[:2]
+        quote = quotes.loc[top]
+        cards.append(dict(sport=quote.sport, game=quote.game, selection=top,
+                          chance=chances.iloc[0], runner_up=next_pick, next_chance=chances.iloc[1],
+                          gap=chances.iloc[0] - chances.iloc[1], odds=quote.american_odds,
+                          book=quote.book, next_odds=quotes.loc[next_pick].american_odds,
+                          next_book=quotes.loc[next_pick].book, books=same_market.book.nunique(),
+                          outcomes=len(chances), start=quote.start))
+    return pd.DataFrame(cards)
+
+
+def render_winner_board(board, close=False):
+    if not board.empty and close:
+        board = board.loc[(board.gap <= 10) & (board.books >= 2)]
+    if board.empty:
+        st.info("No close calls in this scan." if close else "No fresh winner estimates for this selection.")
+        return
+    sort = "gap" if close else "chance"
+    cards = []
+    for row in board.sort_values([sort, "start"], ascending=[close, True]).head(6).itertuples():
+        matchup = f"{row.selection} {row.chance:.1f}% · {row.runner_up} {row.next_chance:.1f}%"
+        note = f"{row.gap:.1f} points apart" if close else f"{row.chance:.1f}% market chance"
+        if row.outcomes == 3:
+            note += " · three outcomes"
+        start = pd.to_datetime(row.start, utc=True).tz_convert("America/New_York")
+        timing = start.strftime("%b %d · %I:%M %p %Z")
+        runner_quote = (f"<p>{escape(row.runner_up)} <strong>{int(row.next_odds):+d}</strong>"
+                        f" at {escape(row.next_book)}</p>") if close else ""
+        cards.append(f"""
+        <article class="trout-card {'close' if close else ''}">
+          <div class="trout-kicker">{escape(note)}</div>
+          <h3>{escape(row.game)}</h3>
+          <p>{escape(matchup)}</p>
+          <p>{escape(row.selection)} <strong>{int(row.odds):+d}</strong> at {escape(row.book)}</p>
+          {runner_quote}
+          <p>{row.books} books compared</p>
+          <p>{timing}</p>
+        </article>""")
+    st.markdown('<div class="trout-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def player_context(rows, market_label, event_id):
+    athletes = sorted({name for name in rows.player.dropna() if name}) if not rows.empty else []
+    if not athletes:
+        return
+    with st.expander("What could move a player's average?"):
+        athlete = st.selectbox("Athlete to review", athletes)
+        lines = sorted(rows.loc[rows.player.eq(athlete), "line"].dropna().unique())
+        if not lines:
+            return
+        prefix = f"context_{event_id}_{market_label}_{athlete}"
+        line = st.selectbox("Prop line to compare", lines, key=f"{prefix}_line")
+        st.caption("Enter a recent average and your own adjustments in the same units as the prop. "
+                   "For example, enter −5 for five fewer yards. Use zero when you have no adjustment.")
+        with st.form(f"{prefix}_form"):
+            average = st.number_input("Recent average per game", min_value=0.0, value=None)
+            changes = [st.number_input(label, value=0.0, step=0.5) for label in (
+                "Health, workload or role", "Opponent or matchup", "Teammates or lineup",
+                "Weather, venue or surface", "Rest, travel or schedule", "Other confirmed factor")]
+            submitted = st.form_submit_button("Compare with the line")
+        if submitted and average is None:
+            st.info("Enter the player's recent average first.")
+        elif submitted:
+            adjusted = max(0.0, average + sum(changes))
+            st.metric("Your adjusted average", f"{adjusted:g}", f"{adjusted - line:+g} vs line")
+        st.caption("This is a manual scenario. The feed supplies the line and prices. "
+                   "Verify availability, recent stats and context separately. An adjusted average "
+                   "does not tell you the chance of going over or under.")
+
+
+
 def sports_workspace(combined):
     key = odds_key()
     st.header("Your sports dashboard" if combined else "Find your sport")
@@ -2278,7 +2398,20 @@ def sports_workspace(combined):
     c1.metric("Upcoming games", rows.event_id.nunique())
     c2.metric("Sportsbooks", rows.book.nunique())
     c3.metric("Leagues", rows.sport.nunique())
-    simple_pick_cards(best, sort_by_chance=False)
+    board = winner_board(rows)
+    tight, sport_picks, prices = st.tabs(["Close Calls", "Best by Sport", "Odds leaderboard"])
+    with tight:
+        st.caption("The top two outcomes are within 10 percentage points across at least two books.")
+        render_winner_board(board, close=True)
+    with sport_picks:
+        groups = sorted({by_key[k].get("group", "Other") for k in selected})
+        group = st.selectbox("Sport", groups, key="scoreboard_sport")
+        leagues = [k for k in selected if by_key[k].get("group", "Other") == group]
+        group_board = board.loc[board.sport.isin(leagues)] if not board.empty else board
+        st.caption("Ranked by the average market chance from books with a complete winner market.")
+        render_winner_board(group_board)
+    with prices:
+        simple_pick_cards(best, sort_by_chance=False)
     with st.expander("Compare all prices and details"):
         st.dataframe(best[["sport", "game", "start", "market", "selection", "line", "book", "american_odds", "normalized_market_pct", "quote_time"]], hide_index=True, use_container_width=True)
     st.caption("Percentages are margin-adjusted sportsbook estimates where complete outcome prices exist. They are not validated forecasts. Injury reports and starting lineups are not verified. Best payout ranks price, not likelihood or expected profit.")
