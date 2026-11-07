@@ -1856,10 +1856,18 @@ def main():
     """, unsafe_allow_html=True)
     pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
     labels = dict(zip(pages, ["🏠 Scoreboard", "🏟️ Best by sport", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
+    pages[:0] = ["Today’s calls", "Replay & Results"]
+    labels.update({"Today’s calls": "🏠 Today’s calls", "Replay & Results": "📊 Replay & Results"})
     pages.append("Published Picks")
     labels["Published Picks"] = "📋 Published Picks"
     section = st.sidebar.radio("Where would you like to go?", pages, format_func=lambda p: labels[p], key="research_area")
     st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
+    if section == "Today’s calls":
+        show_automatic_picks()
+        return
+    if section == "Replay & Results":
+        show_moneyline_replay()
+        return
     if section in ("All-sports leaderboard", "Sport sections"):
         sports_workspace(section == "All-sports leaderboard")
         return
@@ -2194,10 +2202,10 @@ def active_sports(api_key):
     return sorted([r for r in catalog if r.get("active") and r.get("key")], key=lambda r: (r.get("group", "Other"), r.get("title", "")))
 
 
-def eligible_quotes(rows):
+def eligible_quotes(rows, now=None):
     if rows.empty:
         return rows.copy()
-    now = pd.Timestamp.now(tz="UTC")
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     starts = pd.to_datetime(rows.start, utc=True, errors="coerce")
     times = pd.to_datetime(rows.quote_time, utc=True, errors="coerce")
     return rows.loc[(starts > now) & ((now-times).dt.total_seconds().between(0, 600))].copy()
@@ -2269,10 +2277,14 @@ NBA_EDGE_VERSION = "nba-moneyline-v1"
 
 
 def nba_edge_rows(rows):
+    return moneyline_edge_rows(rows if rows.empty else rows.loc[rows.sport.eq("basketball_nba")])
+
+
+def moneyline_edge_rows(rows, now=None):
     if rows.empty:
         return []
-    winners = eligible_quotes(rows)
-    winners = winners.loc[winners.sport.eq("basketball_nba") & winners.market.eq("h2h")]
+    winners = eligible_quotes(rows, now)
+    winners = winners.loc[winners.market.eq("h2h")]
     decisions = []
     for event_id, event in winners.groupby("event_id"):
         first = event.iloc[0]
@@ -2303,7 +2315,7 @@ def nba_edge_rows(rows):
         candidates = [side for side in sides if side["gap"] is not None and side["gap"] >= 3]
         pick = max(candidates, key=lambda side: side["gap"]) if candidates else None
         decisions.append(dict(
-            event_id=event_id, game=first.game, start=str(first.start), market="h2h", line=None,
+            event_id=event_id, game=first.game, sport=first.sport, start=str(first.start), market="h2h", line=None,
             selection=pick["selection"] if pick else None, sides=sides, version=NBA_EDGE_VERSION,
             decision="PICK" if pick else "PASS",
             reason=("Gap at least 3 points" if pick else
@@ -2311,6 +2323,202 @@ def nba_edge_rows(rows):
                     "Gap below 3 points"),
         ))
     return decisions
+
+
+AUTO_LEAGUES = {
+    "basketball_nba": "NBA", "americanfootball_nfl": "NFL",
+    "icehockey_nhl": "NHL", "baseball_mlb": "MLB",
+}
+
+
+def ranked_paper_picks(decisions):
+    picks = []
+    for row in decisions:
+        if row["decision"] != "PICK":
+            continue
+        offer = next(side for side in row["sides"] if side["selection"] == row["selection"])
+        picks.append({**row, **offer})
+    return sorted(picks, key=lambda pick: (
+        -pick["market_chance"], -pick["gap"], pick["start"], pick["event_id"],
+    ))
+
+
+def automatic_parlay(picks):
+    tickets = []
+    for book in sorted({pick["book"] for pick in picks}):
+        legs = [pick for pick in picks if pick["book"] == book][:2]
+        if len(legs) == 2 and legs[0]["event_id"] != legs[1]["event_id"]:
+            chance = math.prod(leg["market_chance"] / 100 for leg in legs)
+            tickets.append((chance, legs))
+    return max(tickets, key=lambda ticket: ticket[0], default=(None, []))
+
+
+def show_automatic_picks():
+    st.header("Today’s calls")
+    st.caption("The bot chooses the singles and ticket. Every call is for paper tracking.")
+    key = odds_key()
+    if not key:
+        st.info("Add your existing ODDS_API_KEY in Streamlit Secrets to load live calls.")
+        return
+    try:
+        leagues = {sport["key"] for sport in active_sports(key)}
+    except FeedError:
+        st.error("The sportsbook feed is unavailable.")
+        return
+    decisions = []
+    for league, label in AUTO_LEAGUES.items():
+        if league not in leagues:
+            continue
+        try:
+            events, _, fetched = sports_feed(league, key, "h2h")
+            rows = odds_rows(events, fetched)
+            if not rows.empty:
+                starts = pd.to_datetime(rows.start, utc=True, errors="coerce").dt.tz_convert("America/New_York")
+                today = pd.Timestamp.now(tz="America/New_York").date()
+                decisions.extend(moneyline_edge_rows(rows.loc[starts.dt.date == today]))
+        except (FeedError, ValueError, TypeError, KeyError):
+            st.caption(f"{label} feed unavailable. Calls use the leagues that loaded.")
+    picks = ranked_paper_picks(decisions)
+    st.subheader("Singles")
+    if not picks:
+        st.info("PASS TODAY · No fresh moneyline cleared the screen in the available games.")
+    for rank, pick in enumerate(picks[:3], 1):
+        with st.container(border=True):
+            st.markdown(f"**{rank}. {pick['selection']} moneyline · {pick['american_odds']:+d} at {pick['book']}**")
+            st.write(pick["game"])
+            st.caption(f"Market estimate {pick['market_chance']:.1f}% · Break-even {pick['break_even']:.1f}%")
+    st.subheader("Parlay")
+    chance, legs = automatic_parlay(picks)
+    if legs:
+        st.write(f"**Two-leg paper parlay at {legs[0]['book']}**")
+        for leg in legs:
+            st.write(f"• {leg['selection']} moneyline ({leg['american_odds']:+d})")
+        st.caption(f"Estimated {chance:.1%} if legs are independent. Sportsbook ticket price and acceptance are unverified.")
+    else:
+        st.info("NO PARLAY · Two qualifying games at the same book are required.")
+    st.caption(f"{len(decisions)} games screened. Calls require fresh prices, two other complete books and a 3-point gap. "
+               "Singles are ranked by estimated win chance. Today's board refreshes with the odds.")
+    track_automatic_calls(key, picks[:3], legs)
+    if decisions:
+        with st.expander("See passed games"):
+            for row in decisions:
+                if row["decision"] == "PASS":
+                    st.write(f"{row['game']} · {row['reason']}")
+    st.caption("Published Picks stores the separate NBA research record after database setup. Replay & Results tests the moneyline rule on historical snapshots.")
+
+
+def track_automatic_calls(key, picks, legs):
+    records = st.session_state.setdefault("automatic_paper_calls", {})
+    tickets = st.session_state.setdefault("automatic_paper_tickets", {})
+    now = pd.Timestamp.now(tz="UTC")
+    for pick in [*picks, *legs]:
+        identity = (pick["event_id"], pick["selection"], pick["book"])
+        records.setdefault(identity, {**pick, "observed": now, "result": "PENDING"})
+    if legs:
+        day = now.tz_convert("America/New_York").date().isoformat()
+        tickets.setdefault(day, tuple((leg["event_id"], leg["selection"], leg["book"]) for leg in legs))
+    if not records:
+        return
+    pending = [pick for pick in records.values() if pick["result"] == "PENDING"
+               and pd.Timestamp(pick["start"]) + pd.Timedelta(hours=3) <= now]
+    for sport in sorted({pick["sport"] for pick in pending}):
+        try:
+            finals, _, _ = sports_feed(sport, key, scores=True)
+        except FeedError:
+            continue
+        by_id = {event["id"]: event for event in finals}
+        for pick in pending:
+            if pick["sport"] == sport and pick["event_id"] in by_id:
+                result = game_result(pick, by_id[pick["event_id"]])
+                if result in ("WIN", "LOSS", "PUSH"):
+                    pick["result"] = result
+    with st.expander("See outcomes from this session"):
+        st.caption("Tracks the first displayed price for each team and book, and the first ticket each day. "
+                   "Results refresh when this page reruns after games. This view resets with the session.")
+        st.dataframe(pd.DataFrame([{
+            "Game": pick["game"], "Pick": pick["selection"], "Book": pick["book"],
+            "Odds": pick["american_odds"], "Result": pick["result"],
+        } for pick in records.values()]), hide_index=True, use_container_width=True)
+        for day, ticket in tickets.items():
+            labels = " + ".join(records[leg]["selection"] for leg in ticket)
+            results = [records[leg]["result"] for leg in ticket]
+            status = ("LOSS" if "LOSS" in results else "PENDING" if "PENDING" in results else
+                      "PUSH LEG · payout ungraded" if "PUSH" in results else "WIN")
+            st.write(f"{day} · {labels} · {status}")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def historical_moneylines(league, key, date):
+    params = urlencode(dict(apiKey=key, regions="us", markets="h2h", oddsFormat="decimal", date=date))
+    body, _, _ = get_json(f"https://api.the-odds-api.com/v4/historical/sports/{league}/odds?{params}")
+    return body["timestamp"], body["data"]
+
+
+def replay_moneylines(snapshots, finals):
+    final_by_id = {event["id"]: event for event in finals}
+    seen = set()
+    results = []
+    for stamp, events in sorted(snapshots, key=lambda snapshot: pd.Timestamp(snapshot[0])):
+        rows = odds_rows(events, stamp)
+        for row in moneyline_edge_rows(rows, stamp):
+            event = final_by_id.get(row["event_id"])
+            if not event or not event.get("completed") or not event.get("scores") or row["event_id"] in seen:
+                continue
+            seen.add(row["event_id"])
+            pick = ranked_paper_picks([row])
+            if not pick:
+                results.append(dict(Game=row["game"], Snapshot=stamp, Decision="PASS",
+                                    Result="PASS", Units=None))
+                continue
+            pick = pick[0]
+            result = game_result(pick, event)
+            units = sports_profit(1, pick["decimal_odds"], result) if result in ("WIN", "LOSS", "PUSH") else None
+            results.append(dict(Game=pick["game"], Snapshot=stamp, Decision=pick["selection"],
+                                Book=pick["book"], Odds=pick["american_odds"],
+                                Result=result, Units=units))
+    return results
+
+
+def show_moneyline_replay():
+    st.header("Replay & Results")
+    st.write("Replay the same moneyline screen on three recent NBA slates using odds captured before tipoff.")
+    st.caption("The test uses 5 PM New York time snapshots, then joins final scores. "
+               "Early games and games without fresh quotes or available scores are excluded. "
+               "This is a short sample of singles.")
+    key = odds_key()
+    st.caption("Historical snapshots require an Odds API paid plan and use up to 30 historical credits, plus a scores request.")
+    if st.button("Run recent NBA replay", disabled=not key):
+        try:
+            finals, _, _ = sports_feed("basketball_nba", key, scores=True)
+            if not any(event.get("completed") and event.get("scores") for event in finals):
+                st.session_state["nba_recent_replay"] = []
+            else:
+                today = pd.Timestamp.now(tz="America/New_York").date()
+                timestamps = [pd.Timestamp(f"{today - pd.Timedelta(days=offset)} 17:00", tz="America/New_York")
+                              for offset in (3, 2, 1)]
+                snapshots = []
+                for stamp in timestamps:
+                    utc = stamp.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+                    captured, events = historical_moneylines("basketball_nba", key, utc)
+                    snapshots.append((captured, [event for event in events if
+                        pd.Timestamp(event["commence_time"]).tz_convert("America/New_York").date() == stamp.date()]))
+                st.session_state["nba_recent_replay"] = replay_moneylines(snapshots, finals)
+        except (FeedError, ValueError, TypeError, KeyError) as exc:
+            st.error(f"Replay unavailable. {exc}" if isinstance(exc, FeedError) else
+                     "Replay unavailable. The provider returned incomplete data.")
+    if "nba_recent_replay" not in st.session_state:
+        return
+    records = st.session_state["nba_recent_replay"]
+    if not records:
+        st.info("No completed games matched usable pregame snapshots.")
+        return
+    graded = [row for row in records if row["Units"] is not None]
+    wins = sum(row["Result"] == "WIN" for row in graded)
+    losses = sum(row["Result"] == "LOSS" for row in graded)
+    st.write(f"**{wins} wins · {losses} losses · {sum(row['Result'] == 'PASS' for row in records)} passes**")
+    if graded:
+        st.metric("Paper return per unit staked", f"{sum(row['Units'] for row in graded) / len(graded):+.1%}")
+    st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
 
 
 def render_nba_edge(decisions):
