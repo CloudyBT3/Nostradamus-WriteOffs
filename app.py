@@ -1802,17 +1802,35 @@ def main():
     st.set_page_config(page_title="Trout Sports Lab", page_icon="🏟️", layout="wide")
     st.markdown("""<style>
     .block-container {max-width:1200px;padding-top:3rem}
-    .trout-hero {background:radial-gradient(ellipse at top right,#145c59,transparent 72%),
-      linear-gradient(120deg,#121d38,#182941);color:#fff;border-radius:24px;
-      padding:clamp(1.4rem,5vw,3rem);margin-bottom:1.25rem}
+    .trout-hero {
+      position:relative;overflow:hidden;isolation:isolate;
+      background:radial-gradient(ellipse at 90% 0%,#255b51,transparent 62%),
+        linear-gradient(115deg,#0a1427 12%,#182e47 100%);
+      color:#fff;border:1px solid #477168;border-radius:24px;
+      padding:clamp(1.4rem,5vw,3rem);margin-bottom:1.25rem;
+      box-shadow:0 14px 38px #08142538}
+    .trout-hero::after {
+      content:"";position:absolute;z-index:-1;inset:-25% -12% -55% 50%;
+      transform:rotate(-22deg);opacity:.17;
+      background:repeating-linear-gradient(90deg,transparent 0 48px,#b2ffd9 49px 51px)}
     .trout-hero h1 {color:#fff;padding:.3rem 0;font-size:clamp(2.2rem,7vw,4.2rem)}
     .trout-hero p {color:#dceaf4;margin:0}
     .trout-kicker {color:#84f7d0;font-size:.8rem;letter-spacing:.16em;font-weight:800}
+    .trout-badge {display:inline-flex;align-items:center;gap:.55rem;border:1px solid #6caa98;
+      background:#102a35;border-radius:999px;padding:.35rem .7rem}
+    .trout-badge::before {content:"";width:.5rem;height:.5rem;border-radius:50%;
+      background:#84f7d0;box-shadow:0 0 12px #84f7d0}
+    [data-testid="stTabs"] [role="tab"] {min-height:44px;padding-inline:.75rem;font-weight:650}
+    [data-testid="stTabs"] [role="tab"]:focus-visible {outline:2px solid #168768;outline-offset:-3px}
     .trout-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));
       gap:12px;margin:.75rem 0 1.25rem}
     .trout-card {background:#172640;color:#f4f8ff;border-radius:16px;padding:1rem;
       border-top:3px solid #75ebc4;overflow-wrap:anywhere}
     .trout-card.close {border-top-color:#ffd485}
+    .trout-card.close .trout-kicker {color:#ffd485}
+    .trout-card {box-shadow:0 5px 16px #08142530}
+    .trout-verdict {display:inline-block;border:1px solid #629f93;border-radius:6px;
+      background:#102f37;padding:.25rem .55rem}
     .trout-card h3 {color:#fff;font-size:1.1rem;padding:.4rem 0}
     .trout-card p {color:#d4e1f1;margin:0 0 .4rem}
     .trout-card strong {color:#9cf7db}
@@ -1825,7 +1843,7 @@ def main():
     </style>""", unsafe_allow_html=True)
     st.markdown("""
     <div class="trout-hero">
-      <div class="trout-kicker">THE PREGAME SCOREBOARD</div>
+      <div class="trout-kicker trout-badge">STADIUM AFTER DARK</div>
       <h1>Trout Sports Lab</h1>
       <p>Find tight matchups, see who the books favor, and compare prices.</p>
     </div>
@@ -2236,6 +2254,24 @@ def simple_pick_cards(rows, sort_by_chance=True):
                 st.caption("Chances may be conditional on no tie or push. Injuries and lineups are not checked. Prices can change.")
 
 
+def winner_prices(market):
+    prices = []
+    for selection, side in market.groupby("selection"):
+        quote = side.sort_values(["decimal_odds", "book"], ascending=[False, True]).iloc[0]
+        peers = side.loc[side.book.ne(quote.book), "normalized_market_pct"]
+        gap = peers.mean() - quote.implied_pct if len(peers) >= 2 else None
+        prices.append(dict(selection=selection, chance=side.normalized_market_pct.mean(),
+                           odds=quote.american_odds, book=quote.book, gap=gap))
+    return sorted(prices, key=lambda row: row["chance"], reverse=True)
+
+
+def hot_player_form(games, baseline, line):
+    recent = sum(games) / len(games)
+    clears = sum(result > line for result in games)
+    hot = len(games) == 5 and baseline > 0 and recent >= 1.2 * baseline and clears >= 4
+    return recent, clears, hot
+
+
 def winner_board(rows):
     """Combine complete fresh winner markets, keeping price and chance separate."""
     if rows.empty:
@@ -2252,16 +2288,12 @@ def winner_board(rows):
         if len(outcome_sets) > 1 and outcome_sets.iloc[0] == outcome_sets.iloc[1]:
             continue
         same_market = event[event.book.isin(signatures[signatures == outcome_sets.index[0]].index)]
-        chances = same_market.groupby("selection").normalized_market_pct.mean().sort_values(ascending=False)
-        quotes = best_quotes(same_market).set_index("selection")
-        top, next_pick = chances.index[:2]
-        quote = quotes.loc[top]
-        cards.append(dict(sport=quote.sport, game=quote.game, selection=top,
-                          chance=chances.iloc[0], runner_up=next_pick, next_chance=chances.iloc[1],
-                          gap=chances.iloc[0] - chances.iloc[1], odds=quote.american_odds,
-                          book=quote.book, next_odds=quotes.loc[next_pick].american_odds,
-                          next_book=quotes.loc[next_pick].book, books=same_market.book.nunique(),
-                          outcomes=len(chances), start=quote.start))
+        prices = winner_prices(same_market)
+        leader, runner_up = prices[:2]
+        first = same_market.iloc[0]
+        cards.append(dict(sport=first.sport, game=first.game, start=first.start,
+                          chance=leader["chance"], gap=leader["chance"] - runner_up["chance"],
+                          books=same_market.book.nunique(), prices=prices))
     return pd.DataFrame(cards)
 
 
@@ -2273,24 +2305,28 @@ def render_winner_board(board, close=False):
         return
     sort = "gap" if close else "chance"
     cards = []
+    st.caption("A paper lean needs a price gap of at least 3 percentage points versus two or more other books. "
+               "The cutoff is a screening rule. Market estimates can be wrong.")
     for row in board.sort_values([sort, "start"], ascending=[close, True]).head(6).itertuples():
-        matchup = f"{row.selection} {row.chance:.1f}% · {row.runner_up} {row.next_chance:.1f}%"
-        note = f"{row.gap:.1f} points apart" if close else f"{row.chance:.1f}% market chance"
-        if row.outcomes == 3:
-            note += " · three outcomes"
+        note = f"{row.gap:.1f} points apart" if close else f"{row.chance:.1f}% top market chance"
         start = pd.to_datetime(row.start, utc=True).tz_convert("America/New_York")
         timing = start.strftime("%b %d · %I:%M %p %Z")
-        runner_quote = (f"<p>{escape(row.runner_up)} <strong>{int(row.next_odds):+d}</strong>"
-                        f" at {escape(row.next_book)}</p>") if close else ""
+        candidates = [side for side in row.prices if side["gap"] is not None and side["gap"] >= 3]
+        lean = max(candidates, key=lambda side: side["gap"]) if candidates else None
+        verdict = f"Paper lean · {lean['selection']}" if lean else "Pass · No qualifying price gap"
+        outcomes = []
+        for side in row.prices:
+            gap = side["gap"]
+            comparison = f"{gap:+.1f} pts vs other books" if gap is not None else "Too few other books"
+            outcomes.append(f"<p><strong>{escape(side['selection'])}</strong> · {side['chance']:.1f}%<br>"
+                            f"{int(side['odds']):+d} at {escape(side['book'])} · {comparison}</p>")
         cards.append(f"""
         <article class="trout-card {'close' if close else ''}">
           <div class="trout-kicker">{escape(note)}</div>
           <h3>{escape(row.game)}</h3>
-          <p>{escape(matchup)}</p>
-          <p>{escape(row.selection)} <strong>{int(row.odds):+d}</strong> at {escape(row.book)}</p>
-          {runner_quote}
-          <p>{row.books} books compared</p>
-          <p>{timing}</p>
+          <p class="trout-verdict"><strong>{escape(verdict)}</strong></p>
+          {''.join(outcomes)}
+          <p>{row.books} books compared · {timing}</p>
         </article>""")
     st.markdown('<div class="trout-grid">' + "".join(cards) + "</div>", unsafe_allow_html=True)
 
@@ -2313,12 +2349,33 @@ def player_context(rows, market_label, event_id):
             changes = [st.number_input(label, value=0.0, step=0.5) for label in (
                 "Health, workload or role", "Opponent or matchup", "Teammates or lineup",
                 "Weather, venue or surface", "Rest, travel or schedule", "Other confirmed factor")]
-            submitted = st.form_submit_button("Compare with the line")
+            st.caption("Optional hot-player check. Use the same stat for all five games and the baseline.")
+            baseline = st.number_input("Longer-run average before those five games", min_value=0.0, value=None)
+            game_log = st.text_input("Last five completed games, separated by commas", placeholder="18, 22, 20, 24, 19")
+            submitted = st.form_submit_button("Review player")
         if submitted and average is None:
             st.info("Enter the player's recent average first.")
         elif submitted:
             adjusted = max(0.0, average + sum(changes))
             st.metric("Your adjusted average", f"{adjusted:g}", f"{adjusted - line:+g} vs line")
+        if submitted and (game_log.strip() or baseline is not None):
+            try:
+                games = [float(value.strip()) for value in game_log.split(",")]
+            except ValueError:
+                games = []
+            if baseline is None or baseline <= 0 or len(games) != 5 or not all(
+                math.isfinite(value) and value >= 0 for value in games
+            ):
+                st.info("Enter five nonnegative game results and a positive longer-run average.")
+            else:
+                recent, clears, hot = hot_player_form(games, baseline, line)
+                summary = f"{athlete} averaged {recent:g} over five games vs. {baseline:g} before that and cleared {line:g} in {clears} of five."
+                if hot:
+                    st.warning(f"🔥 Red hot · {summary}")
+                else:
+                    st.write(summary)
+        st.caption("Red hot means at least 20% above the longer-run average and strictly above today's "
+                   "line in four of five games. This in-app flag is based on the stats you enter.")
         st.caption("This is a manual scenario. The feed supplies the line and prices. "
                    "Verify availability, recent stats and context separately. An adjusted average "
                    "does not tell you the chance of going over or under.")
