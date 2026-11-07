@@ -1,3 +1,4 @@
+import unicodedata
 import hashlib
 import hmac
 import math
@@ -2616,7 +2617,7 @@ def prop_input(frame, columns, dates, numbers):
     return frame
 
 
-def replay_nba_props(box, quotes):
+def replay_nba_props(box, quotes, *, stats_only=False):
     box = prop_input(box, PROP_BOX_COLUMNS, ("final_at",), ("minutes", *PROP_STATS))
     quotes = prop_input(quotes, PROP_QUOTE_COLUMNS, ("start_at", "quote_at", "availability_at"),
                        ("line", "decimal_odds", "expected_minutes"))
@@ -2632,7 +2633,7 @@ def replay_nba_props(box, quotes):
                         & (quotes.start_at - quotes.quote_at <= pd.Timedelta(hours=2))
                         & (quotes.availability_at <= quotes.quote_at)
                         & (quotes.quote_at - quotes.availability_at <= pd.Timedelta(hours=6))
-                        & quotes.availability.eq("confirmed_active") & quotes.expected_minutes.gt(0)]
+                        & quotes.availability.eq("stats_only" if stats_only else "confirmed_active") & quotes.expected_minutes.gt(0)]
     by_player = {player: games.sort_values("final_at") for player, games in box.groupby("player_id")}
     finals = box.set_index(["game_id", "player_id"])
     candidates = []
@@ -2679,10 +2680,166 @@ def replay_nba_props(box, quotes):
     return results, quotes.game_id.nunique()
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def bdl_nba_rows(key, endpoint, params, page_limit):
+    rows, cursor = [], None
+    for _ in range(page_limit):
+        query = {**params, "per_page": 100}
+        if cursor is not None:
+            query["cursor"] = cursor
+        url = "https://api.balldontlie.io/v1/" + endpoint + "?" + urlencode(query, doseq=True)
+        try:
+            with urlopen(Request(url, headers={"Authorization": key}), timeout=12) as response:
+                body = json.load(response)
+        except HTTPError as exc:
+            status = exc.code
+            exc.close()
+            raise FeedError(f"BALLDONTLIE rejected {endpoint} (HTTP {status}). Check key, plan or quota.") from None
+        except (OSError, ValueError):
+            raise FeedError(f"BALLDONTLIE {endpoint} was unavailable.") from None
+        rows.extend(body["data"])
+        cursor = body.get("meta", {}).get("next_cursor")
+        if cursor is None:
+            return rows
+    raise FeedError(f"BALLDONTLIE {endpoint} exceeded the pilot page limit.")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def historical_prop_data(key, snapshot, event_id=""):
+    root = "https://api.the-odds-api.com/v4/historical/sports/basketball_nba/events"
+    params = dict(apiKey=key, date=snapshot)
+    if event_id:
+        root += f"/{quote(event_id, safe='')}/odds"
+        params.update(regions="us", markets="player_points,player_rebounds,player_assists",
+                      oddsFormat="decimal")
+    body, _, _ = get_json(root + "?" + urlencode(params))
+    return body
+
+
+def prop_name(value):
+    return "".join(c for c in unicodedata.normalize("NFKD", value).casefold()
+                   if c.isascii() and c.isalnum())
+
+
+def nba_pilot_inputs(odds_key, stats_key, day):
+    day = pd.Timestamp(day, tz="America/New_York")
+    cutoff = day.replace(hour=16)
+    as_utc = lambda stamp: stamp.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    slate = historical_prop_data(odds_key, as_utc(cutoff))["data"]
+    events = [e for e in slate if pd.Timestamp(e["commence_time"]) > cutoff
+              and pd.Timestamp(e["commence_time"]).tz_convert("America/New_York").date() == day.date()]
+    if not events:
+        raise FeedError("No evening NBA game was found in the historical snapshot.")
+    event = min(events, key=lambda e: (pd.Timestamp(e["commence_time"]), e["id"]))
+    start = pd.Timestamp(event["commence_time"])
+    teams = {prop_name(t["full_name"]): t["id"] for t in bdl_nba_rows(stats_key, "teams", {}, 1)}
+    teams.setdefault("losangelesclippers", teams.get("laclippers"))
+    teams.setdefault("laclippers", teams.get("losangelesclippers"))
+    home, away = (teams.get(prop_name(event[name])) for name in ("home_team", "away_team"))
+    if home is None or away is None:
+        raise FeedError("Could not match both NBA teams across providers.")
+    games = bdl_nba_rows(stats_key, "games", {
+        "team_ids[]": [home, away], "start_date": (day.date() - pd.Timedelta(days=270)).isoformat(),
+        "end_date": day.date().isoformat(),
+    }, 5)
+    matching = [g for g in games if g["home_team"]["id"] == home and g["visitor_team"]["id"] == away
+                and g["date"] == day.date().isoformat()]
+    if len(matching) != 1 or not str(matching[0]["status"]).startswith("Final"):
+        raise FeedError("No unique completed game could be matched across providers.")
+    game_id = matching[0]["id"]
+    prior = [g for g in games if g["date"] < day.date().isoformat()
+             and str(g["status"]).startswith("Final")]
+    ids = {game_id}
+    for team in (home, away):
+        recent = sorted((g for g in prior if team in (g["home_team"]["id"], g["visitor_team"]["id"])),
+                        key=lambda g: g["date"], reverse=True)[:35]
+        ids.update(g["id"] for g in recent)
+    game_dates = {g["id"]: g["date"] for g in games}
+    box_rows, names = [], {}
+    ids = sorted(ids)
+    for offset in range(0, len(ids), 20):
+        for stat in bdl_nba_rows(stats_key, "stats", {"game_ids[]": ids[offset:offset + 20]}, 8):
+            gid = stat["game"]["id"]
+            player = stat["player"]
+            try:
+                minutes, sep, seconds = str(stat["min"]).partition(":")
+                minutes = float(minutes) + (float(seconds) / 60 if sep else 0)
+                counts = [int(stat[k]) for k in ("pts", "reb", "ast")]
+            except (TypeError, ValueError, KeyError):
+                continue
+            # The feed has game dates, not final timestamps. Use the next morning as a conservative cutoff.
+            available = pd.Timestamp(game_dates[gid], tz="America/New_York") + pd.DateOffset(days=1, hours=8)
+            box_rows.append((str(gid), str(player["id"]), available, minutes, *counts))
+            if gid != game_id and minutes > 0:
+                name = prop_name(player["first_name"] + " " + player["last_name"])
+                names.setdefault(name, set()).add(str(player["id"]))
+    box = pd.DataFrame(box_rows, columns=PROP_BOX_COLUMNS)
+    if box.empty:
+        raise FeedError("No player box scores were returned.")
+    snapshot = historical_prop_data(odds_key, as_utc(start - pd.Timedelta(minutes=30)), event["id"])
+    quote_at = pd.Timestamp(snapshot["timestamp"])
+    if not start - pd.Timedelta(hours=2) <= quote_at <= start - pd.Timedelta(minutes=30):
+        raise FeedError("No usable pregame snapshot was returned.")
+    eligible = box.loc[(box.final_at < quote_at) & box.minutes.gt(0) & box.game_id.ne(str(game_id))]
+    projected_minutes = (eligible.sort_values("final_at").groupby("player_id")
+                         .tail(10).groupby("player_id").minutes.median())
+    lines = []
+    for book in snapshot["data"].get("bookmakers", []):
+        for market in book.get("markets", []):
+            metric = market["key"].removeprefix("player_")
+            if metric not in PROP_STATS:
+                continue
+            updated = pd.to_datetime(market.get("last_update", book.get("last_update")), utc=True, errors="coerce")
+            if pd.isna(updated) or not quote_at - pd.Timedelta(minutes=15) <= updated <= quote_at:
+                continue
+            for outcome in market.get("outcomes", []):
+                matches = names.get(prop_name(outcome.get("description", "")), set())
+                if len(matches) != 1:
+                    continue
+                pid = next(iter(matches))
+                if pid not in projected_minutes or outcome.get("name", "").lower() not in ("over", "under"):
+                    continue
+                lines.append((str(game_id), pid, start, quote_at, metric, outcome["name"].lower(),
+                              outcome["point"], outcome["price"], book["title"], projected_minutes[pid],
+                              "stats_only", quote_at))
+    return box, pd.DataFrame(lines, columns=PROP_QUOTE_COLUMNS), f"{event['away_team']} @ {event['home_team']}"
+
+
 def show_prop_test_bench():
     st.header("NBA Prop Test Bench")
     st.info("No verified player-prop picks yet.")
     st.write("Replay a paper strategy on NBA points, rebounds and assists using timed box scores and pregame quotes.")
+    try:
+        stats_key = st.secrets.get("BALLDONTLIE_API_KEY", "")
+    except FileNotFoundError:
+        stats_key = ""
+    odds = odds_key()
+    st.caption("Automatic pilot · one completed evening game · stats only. "
+               "Needs paid historical prop access and BALLDONTLIE player-stat access.")
+    if not (odds and stats_key):
+        st.info("Add ODDS_API_KEY and BALLDONTLIE_API_KEY in Streamlit Secrets to enable the pilot.")
+    recent_day = pd.Timestamp.now(tz="America/New_York").date() - pd.Timedelta(days=2)
+    day = st.date_input("Pilot date", value=recent_day, max_value=recent_day)
+    st.caption("The pilot requests one historical event list and up to 30 historical odds credits, plus player stats requests.")
+    if st.button("Run NBA Prop Test", disabled=not (odds and stats_key), type="primary"):
+        st.session_state.pop("nba_prop_pilot", None)
+        try:
+            with st.spinner("Matching pregame props to player box scores…"):
+                auto_box, auto_quotes, game = nba_pilot_inputs(odds, stats_key, day)
+                st.session_state["nba_prop_pilot"] = (*replay_nba_props(auto_box, auto_quotes, stats_only=True), game)
+        except FeedError as exc:
+            st.error(str(exc))
+        except (ValueError, TypeError, KeyError, OverflowError):
+            st.error("The providers returned incomplete or incompatible pilot data.")
+    if "nba_prop_pilot" in st.session_state:
+        records, games, game = st.session_state["nba_prop_pilot"]
+        st.write(f"**Stats-only pilot · {game}**")
+        st.caption("Minutes use prior appearances. This run has no archived injury or lineup data "
+                   "and uses a conservative next-morning timestamp for prior box scores.")
+        if records:
+            st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
+        else:
+            st.info("No prop qualified in this pilot game.")
     with st.expander("CSV columns and data rules"):
         st.code(",".join(PROP_BOX_COLUMNS))
         st.code(",".join(PROP_QUOTE_COLUMNS))
