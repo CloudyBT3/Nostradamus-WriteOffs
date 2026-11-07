@@ -1856,7 +1856,8 @@ def main():
     """, unsafe_allow_html=True)
     pages = ["All-sports leaderboard", "Sport sections", "Kalshi tennis", "Table tennis", "Paper journal", "BTC contract tracking", "Kalshi all crypto", "BTC trading"]
     labels = dict(zip(pages, ["🏠 Scoreboard", "🏟️ Best by sport", "🎾 Kalshi tennis", "🏓 Table tennis", "📒 Practice picks", "₿ BTC tracking", "🪙 Crypto markets", "📈 BTC research"]))
-    pages[:0] = ["Today’s calls", "Replay & Results"]
+    pages[:0] = ["Today’s calls", "NBA Prop Test Bench", "Replay & Results"]
+    labels["NBA Prop Test Bench"] = "NBA Prop Test Bench"
     labels.update({"Today’s calls": "🏠 Today’s calls", "Replay & Results": "📊 Replay & Results"})
     pages.append("Published Picks")
     labels["Published Picks"] = "📋 Published Picks"
@@ -1864,6 +1865,9 @@ def main():
     st.sidebar.caption("Prices and market estimates, not guaranteed predictions. Export journals before closing: sessions can reset.")
     if section == "Today’s calls":
         show_automatic_picks()
+        return
+    if section == "NBA Prop Test Bench":
+        show_prop_test_bench()
         return
     if section == "Replay & Results":
         show_moneyline_replay()
@@ -2588,6 +2592,135 @@ def replay_moneylines(snapshots, finals):
                                 Book=pick["book"], Odds=pick["american_odds"],
                                 Result=result, Units=units))
     return results
+
+
+PROP_STATS = ("points", "rebounds", "assists")
+PROP_BOX_COLUMNS = ("game_id", "player_id", "final_at", "minutes", *PROP_STATS)
+PROP_QUOTE_COLUMNS = ("game_id", "player_id", "start_at", "quote_at", "market",
+                      "side", "line", "decimal_odds", "book", "expected_minutes",
+                      "availability", "availability_at")
+
+
+def prop_input(frame, columns, dates, numbers):
+    if not set(columns).issubset(frame.columns) or len(frame) > 100000:
+        raise ValueError("Missing required columns or more than 100,000 rows.")
+    frame = frame.loc[:, list(columns)].copy()
+    for name in dates:
+        frame[name] = pd.to_datetime(frame[name], utc=True, errors="raise")
+    for name in numbers:
+        frame[name] = pd.to_numeric(frame[name], errors="raise")
+        if not np.isfinite(frame[name]).all():
+            raise ValueError("Numeric fields must be finite.")
+    if frame.isna().any().any():
+        raise ValueError("Required fields cannot be blank.")
+    return frame
+
+
+def replay_nba_props(box, quotes):
+    box = prop_input(box, PROP_BOX_COLUMNS, ("final_at",), ("minutes", *PROP_STATS))
+    quotes = prop_input(quotes, PROP_QUOTE_COLUMNS, ("start_at", "quote_at", "availability_at"),
+                       ("line", "decimal_odds", "expected_minutes"))
+    if box.duplicated(["game_id", "player_id"]).any():
+        raise ValueError("Use one final box-score row per player and game.")
+    if (box[["minutes", *PROP_STATS]] < 0).any().any() or not (
+        quotes.market.isin(PROP_STATS) & quotes.side.isin(["over", "under"])
+        & quotes.decimal_odds.gt(1) & quotes.line.ge(0)
+        & quotes.expected_minutes.between(0, 60)
+    ).all():
+        raise ValueError("Invalid prop, odds, minutes, or box-score values.")
+    quotes = quotes.loc[(quotes.quote_at < quotes.start_at)
+                        & (quotes.start_at - quotes.quote_at <= pd.Timedelta(hours=2))
+                        & (quotes.availability_at <= quotes.quote_at)
+                        & (quotes.quote_at - quotes.availability_at <= pd.Timedelta(hours=6))
+                        & quotes.availability.eq("confirmed_active") & quotes.expected_minutes.gt(0)]
+    by_player = {player: games.sort_values("final_at") for player, games in box.groupby("player_id")}
+    finals = box.set_index(["game_id", "player_id"])
+    candidates = []
+    for q in quotes.itertuples(index=False):
+        games = by_player.get(q.player_id)
+        if games is None:
+            continue
+        prior = games.loc[(games.final_at < q.quote_at) & games.game_id.ne(q.game_id)
+                          & games.minutes.gt(0)].tail(30)
+        if len(prior) < 20:
+            continue
+        projected = prior[q.market] / prior.minutes * q.expected_minutes
+        wins = int(((projected > q.line) if q.side == "over" else (projected < q.line)).sum())
+        losses = int((projected != q.line).sum()) - wins
+        chance = (wins + 2) / (wins + losses + 4)
+        if chance <= .80 or chance - 1 / q.decimal_odds < .03:
+            continue
+        candidates.append(dict(game_id=q.game_id, player_id=q.player_id, start=q.start_at,
+                               quoted=q.quote_at, market=q.market, side=q.side, line=q.line,
+                               book=q.book, odds=q.decimal_odds, estimate=chance,
+                               projected=float(projected.mean()), edge=chance - 1 / q.decimal_odds))
+    if not candidates:
+        return [], quotes.game_id.nunique()
+    # Choose once per game at the first qualifying snapshot, without seeing results.
+    selected = (pd.DataFrame(candidates)
+                .sort_values(["quoted", "estimate", "edge", "player_id", "market", "side", "line", "book"],
+                             ascending=[True, False, False, True, True, True, True, True])
+                .drop_duplicates("game_id"))
+    results = []
+    for pick in selected.to_dict("records"):
+        key = (pick["game_id"], pick["player_id"])
+        result, actual, units = "UNRESOLVED", None, None
+        if key in finals.index:
+            final = finals.loc[key]
+            if final.final_at > pick["start"]:
+                if final.minutes == 0:
+                    result = "DNP · check book rules"
+                else:
+                    actual = int(final[pick["market"]])
+                    diff = (actual - pick["line"]) * (1 if pick["side"] == "over" else -1)
+                    result = "WIN" if diff > 0 else "LOSS" if diff < 0 else "PUSH"
+                    units = sports_profit(1, pick["odds"], result)
+        results.append({**pick, "actual": actual, "result": result, "units": units})
+    return results, quotes.game_id.nunique()
+
+
+def show_prop_test_bench():
+    st.header("NBA Prop Test Bench")
+    st.info("No verified player-prop picks yet.")
+    st.write("Replay a paper strategy on NBA points, rebounds and assists using timed box scores and pregame quotes.")
+    with st.expander("CSV columns and data rules"):
+        st.code(",".join(PROP_BOX_COLUMNS))
+        st.code(",".join(PROP_QUOTE_COLUMNS))
+        st.write("Use the same game and player IDs in both files. Dates need UTC offsets. Include pregame "
+                 "minutes estimates and a timestamped confirmed_active status. Enter over or under and decimal odds. "
+                 "Bring older box scores too, since each forecast needs at least 20 earlier appearances.")
+    box = st.file_uploader("Final box scores CSV", type="csv", key="prop_box")
+    quotes = st.file_uploader("Pregame props CSV", type="csv", key="prop_quotes")
+    if not box or not quotes:
+        return
+    try:
+        types = {"game_id": "string", "player_id": "string"}
+        records, games = replay_nba_props(pd.read_csv(box, dtype=types), pd.read_csv(quotes, dtype=types))
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        st.error(f"Could not run replay. {exc}")
+        return
+    st.caption("Imported-data replay. The app cannot independently verify the CSV sources, quote availability "
+               "or completeness. Passing these checks does not certify the strategy.")
+    if not records:
+        st.write(f"No qualifying calls across {games} games with eligible inputs.")
+        return
+    wins = sum(row["result"] == "WIN" for row in records)
+    losses = sum(row["result"] == "LOSS" for row in records)
+    settled = [row for row in records if row["units"] is not None]
+    unresolved = len(records) - len(settled)
+    st.write(f"{len(records)} calls across {games} eligible games · {wins} wins · {losses} losses · "
+             f"{len(settled) - wins - losses} pushes · {unresolved} unresolved or DNP")
+    if wins + losses:
+        lo, hi = wilson(wins, wins + losses)
+        roi = sum(row["units"] for row in settled) / len(settled)
+        st.write(f"Hit rate **{wins / (wins + losses):.2%}** · Approximate 95% interval **{lo:.2%} to {hi:.2%}** "
+                 f"· Paper return **{roi:+.2%}**")
+        if wins + losses >= 100 and lo > .80 and roi > 0 and unresolved == 0:
+            st.success("This import clears the preliminary numeric screen. Validate it on an independent prospective record.")
+        else:
+            st.info("Paper testing. The preliminary screen needs at least 100 decisions, a lower interval bound "
+                    "above 80%, positive paper return, and no unresolved grades.")
+    st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
 
 
 def show_moneyline_replay():
