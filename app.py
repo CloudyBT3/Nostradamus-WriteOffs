@@ -2347,10 +2347,41 @@ def open_nba_log(path):
     return db
 
 
+def open_nba_postgres(dsn, driver):
+    db = driver.connect(dsn, autocommit=True, connect_timeout=5, sslmode="require")
+    try:
+        if db.execute("SELECT to_regprocedure('nba_pick_log.prevent_changes()')").fetchone()[0] is None:
+            with db.transaction():
+                db.execute("SELECT pg_advisory_xact_lock(687709821)")
+                db.execute("CREATE SCHEMA IF NOT EXISTS nba_pick_log")
+                db.execute("""CREATE OR REPLACE FUNCTION nba_pick_log.prevent_changes() RETURNS trigger
+                    LANGUAGE plpgsql AS $$
+                    BEGIN
+                        RAISE EXCEPTION 'append-only history';
+                    END;
+                    $$""")
+                for table in ("forecasts", "grades"):
+                    db.execute(f"""CREATE TABLE IF NOT EXISTS nba_pick_log.{table} (
+                        event_id TEXT PRIMARY KEY NOT NULL, recorded_at TEXT NOT NULL,
+                        payload TEXT NOT NULL)""")
+                    db.execute(f"DROP TRIGGER IF EXISTS prevent_changes ON nba_pick_log.{table}")
+                    db.execute(f"""CREATE TRIGGER prevent_changes
+                        BEFORE UPDATE OR DELETE OR TRUNCATE ON nba_pick_log.{table}
+                        FOR EACH STATEMENT EXECUTE FUNCTION nba_pick_log.prevent_changes()""")
+    except Exception:
+        db.close()
+        raise
+    return db
+
+
 def publish_nba(db, decisions):
     saved = 0
-    with db:
-        db.execute("BEGIN IMMEDIATE")
+    local = isinstance(db, sqlite3.Connection)
+    table = "forecasts" if local else "nba_pick_log.forecasts"
+    params = "?, ?, ?" if local else "%s, %s, %s"
+    with (db if local else db.transaction()):
+        if local:
+            db.execute("BEGIN IMMEDIATE")
         for row in decisions:
             now = pd.Timestamp.now(tz="UTC")
             stamps = [stamp for side in row["sides"]
@@ -2360,7 +2391,7 @@ def publish_nba(db, decisions):
             ):
                 continue
             saved += db.execute(
-                "INSERT INTO forecasts VALUES (?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+                f"INSERT INTO {table} VALUES ({params}) ON CONFLICT(event_id) DO NOTHING",
                 (row["event_id"], now.isoformat(), json.dumps(row, sort_keys=True, allow_nan=False)),
             ).rowcount
     return saved
@@ -2368,9 +2399,12 @@ def publish_nba(db, decisions):
 
 def grade_nba(db, events):
     finals = {event["id"]: event for event in events if event.get("completed")}
-    with db:
-        pending = db.execute("""SELECT forecasts.event_id, forecasts.payload FROM forecasts
-            LEFT JOIN grades USING(event_id) WHERE grades.event_id IS NULL""").fetchall()
+    local = isinstance(db, sqlite3.Connection)
+    schema = "" if local else "nba_pick_log."
+    params = "?, ?, ?" if local else "%s, %s, %s"
+    with (db if local else db.transaction()):
+        pending = db.execute(f"""SELECT f.event_id, f.payload FROM {schema}forecasts f
+            LEFT JOIN {schema}grades g USING(event_id) WHERE g.event_id IS NULL""").fetchall()
         for event_id, payload in pending:
             row = json.loads(payload)
             event = finals.get(event_id)
@@ -2382,7 +2416,7 @@ def grade_nba(db, events):
                 continue
             grade = dict(outcomes=outcomes, result=outcomes.get(row["selection"], "PASS"),
                          source="The Odds API", scores=event["scores"])
-            db.execute("INSERT INTO grades VALUES (?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+            db.execute(f"INSERT INTO {schema}grades VALUES ({params}) ON CONFLICT(event_id) DO NOTHING",
                        (event_id, pd.Timestamp.now(tz="UTC").isoformat(), json.dumps(grade, sort_keys=True)))
 
 
@@ -2391,21 +2425,32 @@ def show_published_picks():
     st.caption("The owner publishes one pregame snapshot per matchup. Picks and passes stay in history. "
                "Final scores are added separately.")
     try:
+        dsn = st.secrets.get("NBA_DATABASE_URL", "")
         path = st.secrets.get("NBA_LOG_PATH", "")
         password = st.secrets.get("NBA_PUBLISH_PASSWORD", "")
     except FileNotFoundError:
-        path, password = "", ""
+        dsn, path, password = "", "", ""
     key = odds_key()
-    if not path:
-        st.info("Set NBA_LOG_PATH to a SQLite file on a persistent disk to enable history.")
+    if not (dsn or path):
+        st.info("Set NBA_DATABASE_URL in Streamlit Secrets to connect the Published Picks database.")
         return
+    database_errors = (sqlite3.Error,)
+    if dsn:
+        try:
+            import psycopg
+        except ImportError:
+            st.error("Add psycopg[binary] to requirements.txt to enable Postgres.")
+            return
+        database_errors += (psycopg.Error,)
     with st.expander("Owner controls"):
         entered = st.text_input("Publisher password", type="password")
         authorized = bool(password and hmac.compare_digest(entered.encode(), password.encode()))
         publish = st.button("Scan and publish NBA picks and passes", disabled=not (authorized and key))
         settle = st.button("Grade with recent final scores", disabled=not (authorized and key))
     try:
-        with closing(open_nba_log(path)) as db:
+        schema = "nba_pick_log." if dsn else ""
+        db = open_nba_postgres(dsn, psycopg) if dsn else open_nba_log(path)
+        with closing(db):
             if publish:
                 events, _, fetched = sports_feed("basketball_nba", key, "h2h")
                 decisions = nba_edge_rows(odds_rows(events, fetched))
@@ -2417,14 +2462,15 @@ def show_published_picks():
                 grade_nba(db, events)
                 st.success("Checked recent final scores.")
             history = []
-            for published, forecast, graded, grade in db.execute("""
-                SELECT forecasts.recorded_at, forecasts.payload, grades.recorded_at, grades.payload
-                FROM forecasts LEFT JOIN grades USING(event_id) ORDER BY forecasts.recorded_at, forecasts.event_id
+            for published, forecast, graded, grade in db.execute(f"""
+                SELECT f.recorded_at, f.payload, g.recorded_at, g.payload
+                FROM {schema}forecasts f LEFT JOIN {schema}grades g USING(event_id)
+                ORDER BY f.recorded_at, f.event_id
             """):
                 history.append(dict(published_at=published, forecast=json.loads(forecast),
                                     graded_at=graded, grade=json.loads(grade) if grade else None))
-    except (sqlite3.Error, FeedError, ValueError, TypeError, KeyError):
-        st.error("Could not complete the log operation. Check the database path and sports feed.")
+    except database_errors + (FeedError, ValueError, TypeError, KeyError):
+        st.error("Could not complete the log operation. Check the database connection and sports feed.")
         return
     if not history:
         st.info("No published NBA matchups yet.")
