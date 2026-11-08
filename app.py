@@ -2375,32 +2375,49 @@ def independent_score_forecast(event, history, as_of):
     return {home: (home_score, home_chance), away: (away_score, 100 - home_chance)}
 
 
-def join_forecast_and_price(priced, forecast, three_way):
-    row = {**priced, "selection": None, "decision": "PASS", "forecast": forecast}
+def league_elo(history, as_of):
+    ratings, counts = {}, {}
+    seen = set()
+    for event_id, start, home, away, h, a in sorted(history, key=lambda game: game[1]):
+        if event_id in seen or start + pd.Timedelta(hours=8) > as_of:
+            continue
+        seen.add(event_id)
+        ra, rb = ratings.get(home, 1500.0), ratings.get(away, 1500.0)
+        expected = 1 / (1 + 10 ** ((rb - ra) / 400))
+        result = 1.0 if h > a else 0.5 if h == a else 0.0
+        change = 24 * (result - expected)
+        ratings[home], ratings[away] = ra + change, rb - change
+        counts[home], counts[away] = counts.get(home, 0) + 1, counts.get(away, 0) + 1
+    return ratings, counts
+
+
+def join_forecast_and_price(priced, forecast, three_way, elo=None):
+    row = {**priced, "selection": None, "decision": "PASS", "forecast": forecast, "elo": elo}
     if three_way:
         row["reason"] = "Three-way market needs a separate draw model"
-    elif not forecast:
+    elif not forecast or not elo:
         row["reason"] = "Too little recent final-score history for a forecast"
     else:
         candidates = []
         for side in row["sides"]:
-            side["model_chance"] = forecast[side["selection"]][1]
+            team = side["selection"]
+            side["elo_chance"] = elo[team][0]
+            side["model_chance"] = (forecast[team][1] + side["elo_chance"]) / 2
             side["model_gap"] = side["model_chance"] - side["break_even"]
             if (side["model_chance"] > 50 and side["model_gap"] >= 3
                     and side["gap"] is not None and side["gap"] >= 3):
                 candidates.append(side)
         if candidates:
             row.update(selection=max(candidates, key=lambda side: side["model_gap"])["selection"],
-                       decision="PICK", reason="Score forecast and sportsbook price both qualify")
+                       decision="PICK", reason="Combined Elo and scoring estimate cleared the price screen")
         else:
-            row["reason"] = "Score forecast and sportsbook price did not both qualify"
+            row["reason"] = "Model and sportsbook price did not both clear the edge threshold"
     return row
 
 
-def forecast_sports_board(key, catalog):
+def forecast_sports_board(key, catalog, target_day):
     decisions, unavailable = [], []
     now = pd.Timestamp.now(tz="UTC")
-    today = now.tz_convert("America/New_York").date()
     for sport in catalog:
         league = sport["key"]
         if sport.get("has_outrights"):
@@ -2408,7 +2425,7 @@ def forecast_sports_board(key, catalog):
         try:
             events, _, fetched = sports_feed(league, key, "h2h")
             events = [event for event in events if pd.Timestamp(event["commence_time"]) > now
-                      and pd.Timestamp(event["commence_time"]).tz_convert("America/New_York").date() == today]
+                      and pd.Timestamp(event["commence_time"]).tz_convert("America/New_York").date() == target_day]
             if not events:
                 continue
             try:
@@ -2417,6 +2434,7 @@ def forecast_sports_board(key, catalog):
                 finals = []
                 unavailable.append(f"{sport['title']} scores")
             history = completed_score_history(finals)
+            ratings, counts = league_elo(history, now)
             quotes = odds_rows(events, fetched)
             prices = {row["event_id"]: row for row in moneyline_edge_rows(quotes)}
             for event in events:
@@ -2429,7 +2447,12 @@ def forecast_sports_board(key, catalog):
                                 for book in event.get("bookmakers", []) for market in book.get("markets", [])
                                 for item in market.get("outcomes", []))
                 forecast = independent_score_forecast(event, history, now)
-                decisions.append(join_forecast_and_price(priced, forecast, three_way))
+                home, away = event["home_team"], event["away_team"]
+                elo = None
+                if min(counts.get(home, 0), counts.get(away, 0)) >= 2:
+                    chance = 100 / (1 + 10 ** ((ratings[away] - ratings[home]) / 400))
+                    elo = {home: (chance, counts[home]), away: (100 - chance, counts[away])}
+                decisions.append(join_forecast_and_price(priced, forecast, three_way, elo))
         except (FeedError, ValueError, TypeError, KeyError):
             unavailable.append(f"{sport['title']} odds")
     return decisions, unavailable
@@ -2443,7 +2466,7 @@ def ranked_paper_picks(decisions):
         offer = next(side for side in row["sides"] if side["selection"] == row["selection"])
         picks.append({**row, **offer})
     return sorted(picks, key=lambda pick: (
-        -pick.get("model_chance", pick["market_chance"]), -pick["gap"], pick["start"], pick["event_id"],
+        -pick["model_gap"], -pick["model_chance"], pick["start"], pick["event_id"],
     ))
 
 
@@ -2464,19 +2487,29 @@ def show_automatic_picks():
     if not key:
         st.info("Add your existing ODDS_API_KEY in Streamlit Secrets to load live calls.")
         return
-    st.caption("One scan checks active game markets across the sportsbook catalog and uses Odds API credits. "
-               "The score forecast uses recent final scores. Injury and lineup data are currently unavailable.")
-    if st.button("Scan today’s sports", type="primary"):
-        try:
-            catalog = active_sports(key)
-            with st.spinner("Checking scores and prices across sports…"):
-                st.session_state["forecast_board"] = forecast_sports_board(key, catalog)
-        except FeedError:
-            st.error("The sportsbook catalog is unavailable.")
-    if "forecast_board" not in st.session_state:
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    day = st.date_input("Game date (New York time)", min_value=today, value=today)
+    try:
+        catalog = [sport for sport in active_sports(key) if not sport.get("has_outrights")]
+    except FeedError as exc:
+        st.error(f"Sports catalog unavailable · {exc}")
+        return
+    by_key = {sport["key"]: sport for sport in catalog}
+    defaults = [k for k in ("americanfootball_nfl", "basketball_nba", "icehockey_nhl") if k in by_key]
+    selected = st.multiselect("Leagues to scan", list(by_key), default=defaults,
+                              format_func=lambda k: by_key[k]["title"])
+    st.caption("Up to 3 odds and score credits per selected league on an uncached scan. "
+               "Elo updates from recent finals. Injury and lineup data are unavailable.")
+    scope = (day, tuple(selected))
+    if st.button("Scan for picks", type="primary", disabled=not selected):
+        with st.spinner("Checking Elo, scores and sportsbook prices…"):
+            board = forecast_sports_board(key, [by_key[k] for k in selected], day)
+        st.session_state["forecast_board"] = (scope, board)
+    saved = st.session_state.get("forecast_board")
+    if not saved or saved[0] != scope:
         track_automatic_calls(key, [], [])
         return
-    decisions, unavailable = st.session_state["forecast_board"]
+    decisions, unavailable = saved[1]
     if unavailable:
         with st.expander("Feeds with missing data"):
             st.write(", ".join(unavailable))
@@ -2490,17 +2523,32 @@ def show_automatic_picks():
         ):
             row.update(decision="PASS", selection=None, reason="Price expired. Scan again for fresh odds.")
     picks = ranked_paper_picks(decisions)
-    st.subheader("Singles")
+    st.subheader("Top paper singles")
     if not picks:
-        st.info("PASS TODAY · No fresh moneyline cleared the screen in the available games.")
-    for rank, pick in enumerate(picks[:3], 1):
+        st.info("NO QUALIFYING PICK · See the watchlist and passed games below.")
+    for rank, pick in enumerate(picks[:5], 1):
         with st.container(border=True):
             st.markdown(f"**{rank}. {pick['selection']} moneyline · {pick['american_odds']:+d} at {pick['book']}**")
             st.write(pick["game"])
             projected = " · ".join(f"{team} {score:.1f}" for team, (score, _) in pick["forecast"].items())
             st.write(f"Projected score · {projected}")
-            st.caption(f"Score model {pick['model_chance']:.1f}% · Other books {pick['market_chance']:.1f}% "
-                       f"· Break-even {pick['break_even']:.1f}%")
+            a, b, c = st.columns(3)
+            a.metric("Model chance", f"{pick['model_chance']:.1f}%")
+            b.metric("Break-even", f"{pick['break_even']:.1f}%")
+            c.metric("Model edge", f"+{pick['model_gap']:.1f} pts")
+            _, count = pick["elo"][pick["selection"]]
+            st.caption(f"Elo {pick['elo_chance']:.1f}% from {count} recent results for this side "
+                       f"· Other books {pick['market_chance']:.1f}%")
+    watch = [(row, side) for row in decisions if row["decision"] == "PASS"
+             for side in row["sides"] if side["gap"] is not None and side["gap"] >= 3
+             and all(0 <= (now - pd.Timestamp(stamp)).total_seconds() <= 600
+                     for stamp in [side["quote_time"], *(p["quote_time"] for p in side["peers"])])]
+    if watch:
+        with st.expander("Watchlist · Price signals that did not qualify", expanded=not picks):
+            for row, side in sorted(watch, key=lambda item: -item[1]["gap"])[:5]:
+                with st.container(border=True):
+                    st.write(f"**{side['selection']} moneyline · {side['american_odds']:+d} at {side['book']}**")
+                    st.caption(f"{row['game']} · Other-book gap +{side['gap']:.1f} pts · {row['reason']}")
     st.subheader("Parlay")
     chance, legs = automatic_parlay(picks)
     if legs:
@@ -2510,9 +2558,9 @@ def show_automatic_picks():
         st.caption(f"Estimated {chance:.1%} if legs are independent. Sportsbook ticket price and acceptance are unverified.")
     else:
         st.info("NO PARLAY · Two qualifying games at the same book are required.")
-    st.caption(f"{len(decisions)} upcoming games screened. Picks need the score forecast and the other-book "
+    st.caption(f"{len(decisions)} upcoming games screened. Picks need the combined Elo and score estimate and the other-book "
                "estimate each to exceed break-even by 3 points. Model probabilities are uncalibrated.")
-    track_automatic_calls(key, picks[:3], legs)
+    track_automatic_calls(key, picks[:5], legs)
     if decisions:
         with st.expander("See passed games"):
             for row in decisions:
@@ -2531,7 +2579,7 @@ def track_automatic_calls(key, picks, legs):
         identity = (pick["event_id"], pick["selection"], pick["book"])
         records.setdefault(identity, {**pick, "observed": now, "result": "PENDING"})
     if legs:
-        day = now.tz_convert("America/New_York").date().isoformat()
+        day = pd.Timestamp(legs[0]["start"]).tz_convert("America/New_York").date().isoformat()
         tickets.setdefault(day, tuple((leg["event_id"], leg["selection"], leg["book"]) for leg in legs))
     if not records:
         return
