@@ -2466,7 +2466,7 @@ def ranked_paper_picks(decisions):
         offer = next(side for side in row["sides"] if side["selection"] == row["selection"])
         picks.append({**row, **offer})
     return sorted(picks, key=lambda pick: (
-        -pick["model_gap"], -pick["model_chance"], pick["start"], pick["event_id"],
+        -pick["model_chance"], -pick["model_gap"], pick["start"], pick["event_id"],
     ))
 
 
@@ -2522,13 +2522,15 @@ def show_automatic_picks():
             for stamp in [side["quote_time"], *(peer["quote_time"] for peer in side["peers"])]
         ):
             row.update(decision="PASS", selection=None, reason="Price expired. Scan again for fresh odds.")
-    picks = ranked_paper_picks(decisions)
-    st.subheader("Top paper singles")
+    picks = ranked_paper_picks(decisions)[:5]
+    st.subheader("Best Calls")
+    if decisions:
+        st.caption(f"Call rate for this slate · {len(picks)} of {len(decisions)} screened games")
     if not picks:
-        st.info("NO QUALIFYING PICK · See the watchlist and passed games below.")
-    for rank, pick in enumerate(picks[:5], 1):
+        st.info("PASS · No official call. Check the watchlist and passed games below.")
+    for rank, pick in enumerate(picks, 1):
         with st.container(border=True):
-            st.markdown(f"**{rank}. {pick['selection']} moneyline · {pick['american_odds']:+d} at {pick['book']}**")
+            st.markdown(f"**{'Top Call' if rank == 1 else f'Call {rank}'} · {pick['selection']} moneyline · {pick['american_odds']:+d} at {pick['book']}**")
             st.write(pick["game"])
             projected = " · ".join(f"{team} {score:.1f}" for team, (score, _) in pick["forecast"].items())
             st.write(f"Projected score · {projected}")
@@ -2536,6 +2538,8 @@ def show_automatic_picks():
             a.metric("Model chance", f"{pick['model_chance']:.1f}%")
             b.metric("Break-even", f"{pick['break_even']:.1f}%")
             c.metric("Model edge", f"+{pick['model_gap']:.1f} pts")
+            limit = math.ceil(10000 / (min(pick["model_chance"], pick["market_chance"]) - 3)) / 100
+            st.caption(f"Minimum acceptable odds: {limit:.2f} decimal or better, using this scan's estimates.")
             _, count = pick["elo"][pick["selection"]]
             st.caption(f"Elo {pick['elo_chance']:.1f}% from {count} recent results for this side "
                        f"· Other books {pick['market_chance']:.1f}%")
@@ -2560,7 +2564,7 @@ def show_automatic_picks():
         st.info("NO PARLAY · Two qualifying games at the same book are required.")
     st.caption(f"{len(decisions)} upcoming games screened. Picks need the combined Elo and score estimate and the other-book "
                "estimate each to exceed break-even by 3 points. Model probabilities are uncalibrated.")
-    track_automatic_calls(key, picks[:5], legs)
+    track_automatic_calls(key, picks, legs)
     if decisions:
         with st.expander("See passed games"):
             for row in decisions:
@@ -2596,6 +2600,17 @@ def track_automatic_calls(key, picks, legs):
                 result = game_result(pick, by_id[pick["event_id"]])
                 if result in ("WIN", "LOSS", "PUSH"):
                     pick["result"] = result
+    first_by_game = {}
+    for pick in records.values():
+        first_by_game.setdefault(pick["event_id"], pick)
+    wins = sum(pick["result"] == "WIN" for pick in first_by_game.values())
+    losses = sum(pick["result"] == "LOSS" for pick in first_by_game.values())
+    if wins + losses:
+        st.metric("Official call win rate · this session", f"{wins / (wins + losses):.0%}",
+                  help=f"{wins} wins and {losses} losses. Uses the first call per game and excludes pushes and pending games.")
+        st.caption(f"{wins} wins · {losses} losses across settled first calls")
+    else:
+        st.caption("Official call win rate appears after a first call settles as a win or loss in this session.")
     with st.expander("See outcomes from this session"):
         st.caption("Tracks the first displayed price for each team and book, and the first ticket each day. "
                    "Results refresh when this page reruns after games. This view resets with the session.")
